@@ -492,6 +492,10 @@ func (l *NodeSyncListener) handleUpdated(ctx context.Context, event InboundEvent
 	if event.Insecure {
 		clashConfig = withSkipCertVerify(clashConfig)
 	}
+	nodeName := strings.TrimSpace(event.NodeName)
+	if nodeName != "" {
+		clashConfig = withClashName(clashConfig, nodeName)
+	}
 
 	// 中转:该 (server,tag) 下若存在中转节点 —— 本次编辑新填了中转地址,或节点本就配了中转 ——
 	// 必须把重生成的配置改写成中转地址(而非源站 host)后全量更新。否则:
@@ -504,8 +508,8 @@ func (l *NodeSyncListener) handleUpdated(ctx context.Context, event InboundEvent
 	}
 
 	// v4/域名节点:用 base 配置(server = chooseClashServerHost)更新。
-	// 订阅生成时 proxy 名取 node_name 列(subscription.go:988),clash_config 内的 name 仅内部用,无需特意保留。
-	if err := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, clashConfig, "v4"); err != nil {
+	// 编辑请求携带自定义名称时,同步更新 node_name 与 clash_config 内部名称。
+	if err := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, clashConfig, "v4", nodeName); err != nil {
 		log.Printf("[NodeSync] Failed to update v4 node: %v", err)
 	}
 
@@ -515,8 +519,13 @@ func (l *NodeSyncListener) handleUpdated(ctx context.Context, event InboundEvent
 		var m map[string]any
 		if json.Unmarshal([]byte(clashConfig), &m) == nil {
 			name, _ := m["name"].(string)
+			v6NodeName := nodeName
+			if v6NodeName != "" && event.IPVersion == "both" {
+				v6NodeName += "(v6)"
+				name = v6NodeName
+			}
 			if v6cfg, cerr := cloneClashWithServer(m, name, v6Host); cerr == nil {
-				if err := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, v6cfg, "v6"); err != nil {
+				if err := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, v6cfg, "v6", v6NodeName); err != nil {
 					log.Printf("[NodeSync] Failed to update v6 node: %v", err)
 				}
 			}
@@ -569,10 +578,15 @@ func (l *NodeSyncListener) applyRelayNodesOnUpdate(ctx context.Context, serverNa
 			relayPort = origPort // 端口默认填源站(节点)端口
 		}
 
-		cfg, cerr := cloneClashWithServerPort(m, n.NodeName, relayHost, relayPort)
+		nodeName := strings.TrimSpace(event.NodeName)
+		if nodeName == "" {
+			nodeName = n.NodeName
+		}
+		cfg, cerr := cloneClashWithServerPort(m, nodeName, relayHost, relayPort)
 		if cerr != nil {
 			continue
 		}
+		n.NodeName = nodeName
 		n.ClashConfig = cfg
 		n.ParsedConfig = cfg
 		n.RelayOrigServer = origHost
@@ -584,6 +598,19 @@ func (l *NodeSyncListener) applyRelayNodesOnUpdate(ctx context.Context, serverNa
 		handled = true
 	}
 	return handled
+}
+
+func withClashName(cfgJSON, name string) string {
+	var m map[string]any
+	if json.Unmarshal([]byte(cfgJSON), &m) != nil {
+		return cfgJSON
+	}
+	m["name"] = name
+	b, err := json.Marshal(m)
+	if err != nil {
+		return cfgJSON
+	}
+	return string(b)
 }
 
 // clashServerPortOf 从 clash proxy JSON 读出顶层 server 与 port,取不到 server 返回 ok=false。

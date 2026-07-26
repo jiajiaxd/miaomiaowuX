@@ -999,7 +999,8 @@ func (r *TrafficRepository) UpdateNodesByServerName(ctx context.Context, oldName
 //	"" → 全部(向后兼容);"v4" → 只更新 v4/域名/通用节点(ip_family != 'v6');"v6" → 只更新 IPv6 节点(ip_family = 'v6')。
 //
 // v4/v6 双节点共享同一 inbound_tag,编辑入站时需各自用对应 server 的配置分别更新,避免互相覆盖。
-func (r *TrafficRepository) UpdateNodeByInboundTag(ctx context.Context, serverName, inboundTag, clashConfig, family string) error {
+// nodeName 非空时同步更新节点名称。
+func (r *TrafficRepository) UpdateNodeByInboundTag(ctx context.Context, serverName, inboundTag, clashConfig, family, nodeName string) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
@@ -1010,10 +1011,17 @@ func (r *TrafficRepository) UpdateNodeByInboundTag(ctx context.Context, serverNa
 		return errors.New("server name and inbound tag are required")
 	}
 
+	args := []any{clashConfig, clashConfig}
 	query := `
 		UPDATE nodes
-		SET clash_config = ?, parsed_config = ?, updated_at = CURRENT_TIMESTAMP
+		SET clash_config = ?, parsed_config = ?`
+	if nodeName = strings.TrimSpace(nodeName); nodeName != "" {
+		query += `, node_name = ?`
+		args = append(args, nodeName)
+	}
+	query += `, updated_at = CURRENT_TIMESTAMP
 		WHERE original_server = ? AND inbound_tag = ?`
+	args = append(args, serverName, inboundTag)
 	switch family {
 	case "v4":
 		query += ` AND IFNULL(ip_family, '') != 'v6'`
@@ -1021,7 +1029,7 @@ func (r *TrafficRepository) UpdateNodeByInboundTag(ctx context.Context, serverNa
 		query += ` AND IFNULL(ip_family, '') = 'v6'`
 	}
 
-	_, err := r.db.ExecContext(ctx, query, clashConfig, clashConfig, serverName, inboundTag)
+	_, err := r.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("update node by inbound tag: %w", err)
 	}
