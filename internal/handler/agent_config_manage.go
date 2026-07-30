@@ -810,7 +810,8 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 		log.Printf("[Remote Server] agent uninstall accepted before deleting server %s", serverName)
 	}
 
-	if err := h.repo.DeleteRemoteServer(ctx, req.ID); err != nil {
+	deleteNodes := req.DeleteNodes != nil && *req.DeleteNodes
+	if err := h.repo.DeleteRemoteServer(ctx, req.ID, deleteNodes); err != nil {
 		msg := "删除服务器失败"
 		if err == storage.ErrRemoteServerNotFound {
 			msg = "服务器不存在"
@@ -821,16 +822,6 @@ func (h *XrayServerHandler) DeleteRemoteServer(w stdhttp.ResponseWriter, r *stdh
 			Message: msg,
 		})
 		return
-	}
-
-	// 连带删节点:前端删除确认默认勾选(delete_nodes=true)。否则节点残留、订阅里仍可连
-	// (分享服务器场景尤其明显:移除分享服务器后接收方建的节点还有效)。
-	if req.DeleteNodes != nil && *req.DeleteNodes && serverName != "" {
-		if n, derr := h.repo.DeleteNodesByOriginalServer(ctx, serverName); derr != nil {
-			log.Printf("[Remote Server] delete nodes for %s failed: %v", serverName, derr)
-		} else if n > 0 {
-			log.Printf("[Remote Server] deleted %d nodes for removed server %s", n, serverName)
-		}
 	}
 
 	// 删后清掉该 server 的 inbound 内存缓存,避免残留(否则同 id 复用时会读到旧 inbound 数据)。

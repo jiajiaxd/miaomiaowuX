@@ -95,7 +95,7 @@ func (h *AddSharedServerHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 	if err := h.repo.SetFederatedServer(r.Context(), server.ID, ownerURL, shareToken, strings.TrimSpace(req.Prefix)); err != nil {
 		// 回滚:删除刚建的服务器行
-		_ = h.repo.DeleteRemoteServer(r.Context(), server.ID)
+		_ = h.repo.DeleteRemoteServer(r.Context(), server.ID, false)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

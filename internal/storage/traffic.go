@@ -11274,7 +11274,7 @@ func (r *TrafficRepository) ReorderRemoteServers(ctx context.Context, ids []int6
 	return nil
 }
 
-func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64) error {
+func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64, deleteNodes bool) error {
 	if r == nil || r.db == nil {
 		return errors.New("traffic repository not initialized")
 	}
@@ -11300,14 +11300,16 @@ func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64) er
 	}
 	defer tx.Rollback() //nolint:errcheck // commit 成功后 rollback 为 no-op
 
-	// 1) 用户子账户:按 routed_node_id 关联,经 nodes.original_server 反查该服务器的(routed)节点。必须在删 nodes 之前。
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM user_subaccounts WHERE routed_node_id IN (SELECT id FROM nodes WHERE original_server = ?)`, name); err != nil {
-		return fmt.Errorf("delete user_subaccounts: %w", err)
-	}
-	// 2) 该服务器入站同步出来的所有节点(普通 + routed),按 original_server 名字。
-	if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE original_server = ?`, name); err != nil {
-		return fmt.Errorf("delete nodes: %w", err)
+	if deleteNodes {
+		// 1) 用户子账户:按 routed_node_id 关联,经 nodes.original_server 反查该服务器的(routed)节点。必须在删 nodes 之前。
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM user_subaccounts WHERE routed_node_id IN (SELECT id FROM nodes WHERE original_server = ?)`, name); err != nil {
+			return fmt.Errorf("delete user_subaccounts: %w", err)
+		}
+		// 2) 该服务器入站同步出来的所有节点(普通 + routed),按 original_server 名字。
+		if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE original_server = ?`, name); err != nil {
+			return fmt.Errorf("delete nodes: %w", err)
+		}
 	}
 	// 3) server_id 关联的数据:活跃运营(凭据/出站/xray 快照/批量记录/到期通知 flag)+ 历史流量统计。
 	//    服务器删除后这些全是孤儿,一并清掉。表名为内部常量,非用户输入,无注入风险。
