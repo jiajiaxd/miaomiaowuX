@@ -21,6 +21,19 @@ func TestMigrationTimestampsEqualUsesPostgresPrecision(t *testing.T) {
 	}
 }
 
+func TestPostgresTimezoneIsUTC(t *testing.T) {
+	for _, value := range []string{"UTC", "Etc/UTC", "GMT", "etc/gmt"} {
+		if !postgresTimezoneIsUTC(value) {
+			t.Fatalf("%q should be accepted as UTC", value)
+		}
+	}
+	for _, value := range []string{"Asia/Shanghai", "America/New_York", "+08:00", ""} {
+		if postgresTimezoneIsUTC(value) {
+			t.Fatalf("%q must not be accepted as UTC", value)
+		}
+	}
+}
+
 func TestDatabaseConfigRoundTripAndPermissions(t *testing.T) {
 	dir := t.TempDir()
 	in := DatabaseConfig{Driver: "postgresql", Host: "db", Port: 5432, Database: "mmwx", Username: "app", Password: "secret", SSLMode: "require"}

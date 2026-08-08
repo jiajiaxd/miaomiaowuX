@@ -1083,6 +1083,9 @@ func NewTrafficRepositoryFromConfig(cfg DatabaseConfig) (*TrafficRepository, err
 	} else if err := db.PingContext(checkCtx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("connect PostgreSQL: %w", err)
+	} else if err := ensurePostgresUTCTimezone(checkCtx, db, cfg); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("configure PostgreSQL timezone: %w", err)
 	}
 	if err := repo.migrate(); err != nil {
 		_ = db.Close()
@@ -1090,6 +1093,38 @@ func NewTrafficRepositoryFromConfig(cfg DatabaseConfig) (*TrafficRepository, err
 	}
 
 	return repo, nil
+}
+
+// ensurePostgresUTCTimezone verifies the session invariant required by the
+// SQLite-compatible TIMESTAMP WITHOUT TIME ZONE schema. The DSN already sends
+// timezone=UTC for every pooled connection; these ALTER statements persist the
+// same default for tools and future connections when the database user owns
+// the role/database. Managed PostgreSQL may deny ALTER DATABASE, which is safe:
+// the per-connection DSN remains authoritative.
+func ensurePostgresUTCTimezone(ctx context.Context, db *dialectDB, cfg DatabaseConfig) error {
+	var timezone string
+	if err := db.QueryRowContext(ctx, `SELECT current_setting('TimeZone')`).Scan(&timezone); err != nil {
+		return fmt.Errorf("read current timezone: %w", err)
+	}
+	if !postgresTimezoneIsUTC(timezone) {
+		return fmt.Errorf("session timezone is %q, expected UTC", timezone)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER ROLE `+quoteIdentifier(cfg.Username)+` IN DATABASE `+quoteIdentifier(cfg.Database)+` SET timezone TO 'UTC'`); err != nil {
+		log.Printf("[storage] persist PostgreSQL role timezone as UTC failed (session remains UTC): %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER DATABASE `+quoteIdentifier(cfg.Database)+` SET timezone TO 'UTC'`); err != nil {
+		log.Printf("[storage] persist PostgreSQL database timezone as UTC failed (session remains UTC): %v", err)
+	}
+	return nil
+}
+
+func postgresTimezoneIsUTC(value string) bool {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "UTC", "ETC/UTC", "GMT", "ETC/GMT":
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *TrafficRepository) DatabaseConfig() DatabaseConfig { return r.config }
