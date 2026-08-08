@@ -117,7 +117,7 @@ func applyNodeNameFilterToProxies(proxies []any, filterRegex *regexp.Regexp, fil
 }
 
 // 用于由用户触发的手动同步 - 同步所有外部订阅，无论 ForceSyncExternal 设置如何
-func syncExternalSubscriptionsManual(ctx context.Context, repo *storage.TrafficRepository, subscribeDir, username string) (manualExternalSyncResult, error) {
+func syncExternalSubscriptionsManual(ctx context.Context, repo *storage.TrafficRepository, subscribeDir, username string, deferNewNodes bool) (manualExternalSyncResult, error) {
 	var result manualExternalSyncResult
 	if repo == nil || username == "" {
 		return result, fmt.Errorf("invalid parameters")
@@ -175,7 +175,7 @@ func syncExternalSubscriptionsManual(ctx context.Context, repo *storage.TrafficR
 
 	for i, sub := range externalSubs {
 		logger.Info("[外部订阅同步-手动] 开始同步订阅", "index", i+1, "total", len(externalSubs), "name", sub.Name)
-		nodeCount, updatedSub, candidates, err := syncSingleExternalSubscriptionWithSelection(ctx, client, repo, subscribeDir, username, sub, userSettings, true)
+		nodeCount, updatedSub, candidates, err := syncSingleExternalSubscriptionWithSelection(ctx, client, repo, subscribeDir, username, sub, userSettings, deferNewNodes)
 		if err != nil {
 			logger.Info("[外部订阅同步-手动] 同步订阅失败", "index", i+1, "total", len(externalSubs), "name", sub.Name, "error", err)
 			continue
@@ -1039,7 +1039,8 @@ func (h *SyncSingleExternalSubscriptionHandler) ServeHTTP(w http.ResponseWriter,
 		Timeout: 30 * time.Second,
 	}
 
-	nodeCount, updatedSub, candidates, err := syncSingleExternalSubscriptionWithSelection(r.Context(), client, h.repo, h.subscribeDir, ownerUsername, *targetSub, userSettings, true)
+	selectionMode := r.URL.Query().Get("selection") == "1"
+	nodeCount, updatedSub, candidates, err := syncSingleExternalSubscriptionWithSelection(r.Context(), client, h.repo, h.subscribeDir, ownerUsername, *targetSub, userSettings, selectionMode)
 	if err != nil {
 		logger.Info("[Sync API] Failed to sync subscription", "name", targetSub.Name, "error", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -1058,10 +1059,13 @@ func (h *SyncSingleExternalSubscriptionHandler) ServeHTTP(w http.ResponseWriter,
 		logger.Info("[Sync API] 更新订阅 的同步时间失败", "name", targetSub.Name, "error", err)
 	}
 
-	sessionID, err := storeExternalSyncSelection(username, candidates)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("create selection session: %w", err))
-		return
+	sessionID := ""
+	if selectionMode && len(candidates) > 0 {
+		sessionID, err = storeExternalSyncSelection(username, candidates)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("create selection session: %w", err))
+			return
+		}
 	}
 
 	logger.Info("[Sync API] Successfully synced subscription , synced nodes", "name", targetSub.Name, "param", nodeCount)
@@ -1092,7 +1096,8 @@ func (h *SyncExternalSubscriptionsHandler) ServeHTTP(w http.ResponseWriter, r *h
 	logger.Info("[Sync API] Manual sync triggered by user", "user", username)
 
 	// 使用手动同步功能，忽略 ForceSyncExternal 设置
-	result, err := syncExternalSubscriptionsManual(r.Context(), h.repo, h.subscribeDir, username)
+	selectionMode := r.URL.Query().Get("selection") == "1"
+	result, err := syncExternalSubscriptionsManual(r.Context(), h.repo, h.subscribeDir, username, selectionMode)
 	if err != nil {
 		logger.Info("[Sync API] Failed to sync external subscriptions for user", "user", username, "error", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -1102,10 +1107,13 @@ func (h *SyncExternalSubscriptionsHandler) ServeHTTP(w http.ResponseWriter, r *h
 		})
 		return
 	}
-	sessionID, err := storeExternalSyncSelection(username, result.Candidates)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("create selection session: %w", err))
-		return
+	sessionID := ""
+	if selectionMode && len(result.Candidates) > 0 {
+		sessionID, err = storeExternalSyncSelection(username, result.Candidates)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("create selection session: %w", err))
+			return
+		}
 	}
 
 	logger.Info("[Sync API] Successfully synced external subscriptions for user", "user", username)
