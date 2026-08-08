@@ -424,9 +424,18 @@ func (h *TrafficSummaryHandler) loadHistory(ctx context.Context, days int) ([]tr
 		return nil, nil
 	}
 
-	// 优先用 per-server 快照差分 —— 它对月度重置免疫(见 ListServerDailyCumulative 的说明)。
-	// 快照表要等 daily_snapshot 任务跑过才有数据,所以拿不到时回落到老的
-	// traffic_records 总量差分(重置日会是断点,但至少正常日子的数字是对的)。
+	// 日账本在采集时直接记录每个日历日的增量，是每日折线图的权威数据源。
+	// 旧实现优先用累计快照做相邻日期差分；新安装的第一份快照只能当基线，
+	// 即使日账本里已有安装首日/次日的真实流量，图上也要等到第二份快照后才
+	// 出现一个点，表现为“前两天消失、只剩今天”。
+	if usages, err := h.loadHistoryFromDailyLedger(ctx, days); err == nil && len(usages) > 0 {
+		return usages, nil
+	} else if err != nil {
+		logger.Warn("[流量统计] 日账本读取失败,回落快照差分", "error", err)
+	}
+
+	// 兼容升级前没有日账本的历史库：先尝试 per-server 快照差分，再回落旧的
+	// traffic_records 总量差分。
 	if usages, err := h.loadHistoryFromSnapshots(ctx, days); err == nil && len(usages) > 0 {
 		return usages, nil
 	} else if err != nil {
@@ -488,6 +497,45 @@ func (h *TrafficSummaryHandler) loadHistory(ctx context.Context, days int) ([]tr
 	}
 
 	return fillMissingDays(usages), nil
+}
+
+// loadHistoryFromDailyLedger aggregates ingestion-time server/day deltas while
+// preserving each server's configured traffic source and accounting mode.
+func (h *TrafficSummaryHandler) loadHistoryFromDailyLedger(ctx context.Context, days int) ([]trafficDailyUsage, error) {
+	rows, err := h.repo.ListServerDailyTraffic(ctx, days, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	servers, err := h.repo.ListRemoteServers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	modes := make(map[int64]string, len(servers))
+	for _, server := range servers {
+		modes[server.ID] = server.TrafficStatsMode
+	}
+	return aggregateDailyLedgerHistory(rows, modes, days), nil
+}
+
+func aggregateDailyLedgerHistory(rows []storage.ServerDailyTraffic, modes map[int64]string, days int) []trafficDailyUsage {
+	perDate := make(map[string]float64, days+1)
+	for _, row := range rows {
+		perDate[row.Date] += applyTrafficMode(float64(row.Uplink), float64(row.Downlink), modes[row.ServerID])
+	}
+	dates := make([]string, 0, len(perDate))
+	for date := range perDate {
+		dates = append(dates, date)
+	}
+	sort.Strings(dates)
+	usages := make([]trafficDailyUsage, 0, len(dates))
+	for _, date := range dates {
+		gb := roundUpTwoDecimals(bytesToGigabytes(int64(perDate[date])))
+		usages = append(usages, trafficDailyUsage{Date: date, UsedGB: &gb})
+	}
+	return fillMissingDays(usages)
 }
 
 // fillMissingDays 把首尾之间缺失的日历日补成 UsedGB=nil 的空点。
