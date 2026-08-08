@@ -62,6 +62,55 @@ func TestDailyTrafficLedgerBooksOnlyObservedDelta(t *testing.T) {
 	}
 }
 
+func TestExternalSubscriptionUpdateBooksDailyDelta(t *testing.T) {
+	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "external-ledger.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+	id, err := repo.CreateExternalSubscription(ctx, ExternalSubscription{
+		Username: "alice", Name: "provider", URL: "https://example.com/sub",
+		Upload: 100, Download: 200, TrafficMode: "both",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := repo.GetExternalSubscription(ctx, id, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub.Upload, sub.Download = 140, 260
+	if err := repo.UpdateExternalSubscription(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	// Re-saving unchanged metadata must not duplicate the traffic delta.
+	if err := repo.UpdateExternalSubscription(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := repo.ListDailyExternalSubscriptionTraffic(ctx, trafficLedgerDate(time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ExternalSubscriptionID != id || rows[0].Uplink != 40 || rows[0].Downlink != 60 {
+		t.Fatalf("unexpected external daily traffic: %+v", rows)
+	}
+
+	// Provider-side reset: the new counter is the first observed traffic of the
+	// new sequence and must not be discarded as a negative delta.
+	sub.Upload, sub.Download = 5, 7
+	if err := repo.UpdateExternalSubscription(ctx, sub); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = repo.ListDailyExternalSubscriptionTraffic(ctx, trafficLedgerDate(time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Uplink != 45 || rows[0].Downlink != 67 {
+		t.Fatalf("unexpected external daily traffic after reset: %+v", rows)
+	}
+}
+
 func TestSystemTrafficLedgerAndDuplicateReport(t *testing.T) {
 	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "system-ledger.db"))
 	if err != nil {

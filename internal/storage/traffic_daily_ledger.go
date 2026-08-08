@@ -80,6 +80,20 @@ CREATE INDEX IF NOT EXISTS idx_traffic_daily_system_servers_date ON traffic_dail
 	if _, err := r.db.Exec(schema); err != nil {
 		return err
 	}
+	const externalSchema = `
+CREATE TABLE IF NOT EXISTS traffic_daily_external_subscriptions (
+    external_subscription_id INTEGER NOT NULL,
+    date TEXT NOT NULL,
+    uplink INTEGER NOT NULL DEFAULT 0,
+    downlink INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (external_subscription_id, date),
+    FOREIGN KEY (external_subscription_id) REFERENCES external_subscriptions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_daily_external_subscriptions_date ON traffic_daily_external_subscriptions(date);`
+	if _, err := r.db.Exec(externalSchema); err != nil {
+		return err
+	}
 	const meta = `CREATE TABLE IF NOT EXISTS traffic_daily_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);`
 	if _, err := r.db.Exec(meta); err != nil {
 		return err
@@ -214,6 +228,50 @@ type DailyUserNodeTraffic struct {
 	NodeID                                             int64
 	Username                                           string
 	Uplink, Downlink, WeightedUplink, WeightedDownlink float64
+}
+
+type DailyExternalSubscriptionTraffic struct {
+	ExternalSubscriptionID int64
+	Uplink                 int64
+	Downlink               int64
+}
+
+// addDailyExternalSubscriptionTraffic stores only the increase observed since
+// the previous successful refresh. A provider counter reset starts a new
+// monotonic sequence, so the new value itself is the first delta after reset.
+func addDailyExternalSubscriptionTraffic(ctx context.Context, ex sqlExecutor, date string, subscriptionID, oldUp, oldDown, newUp, newDown int64) error {
+	delta := func(oldValue, newValue int64) int64 {
+		if newValue >= oldValue {
+			return newValue - oldValue
+		}
+		return newValue
+	}
+	uplink, downlink := delta(oldUp, newUp), delta(oldDown, newDown)
+	if uplink == 0 && downlink == 0 {
+		return nil
+	}
+	_, err := ex.ExecContext(ctx, `INSERT INTO traffic_daily_external_subscriptions(external_subscription_id,date,uplink,downlink)
+VALUES(?,?,?,?) ON CONFLICT(external_subscription_id,date) DO UPDATE SET
+uplink=traffic_daily_external_subscriptions.uplink+excluded.uplink,
+downlink=traffic_daily_external_subscriptions.downlink+excluded.downlink,updated_at=CURRENT_TIMESTAMP`, subscriptionID, date, uplink, downlink)
+	return err
+}
+
+func (r *TrafficRepository) ListDailyExternalSubscriptionTraffic(ctx context.Context, date string) ([]DailyExternalSubscriptionTraffic, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT external_subscription_id,SUM(uplink),SUM(downlink) FROM traffic_daily_external_subscriptions WHERE date=? GROUP BY external_subscription_id`, date)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DailyExternalSubscriptionTraffic
+	for rows.Next() {
+		var item DailyExternalSubscriptionTraffic
+		if err := rows.Scan(&item.ExternalSubscriptionID, &item.Uplink, &item.Downlink); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 
 // ServerDailyTraffic is the authoritative per-calendar-day traffic for one

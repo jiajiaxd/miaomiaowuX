@@ -350,20 +350,17 @@ type dailyIncrementData struct {
 	UserLines []string
 }
 
-// buildDailyIncrementData 用连续两个本地零点快照计算完整自然日增量。
-// 推送通常在早上执行，因此 today(今日 00:00) - yesterday(昨日 00:00) 正好是昨日全天。
+// buildDailyIncrementData reads the immutable ingestion-time ledger for the
+// previous calendar day. Node traffic is reported only when the server/tag can
+// still be resolved to an item in the node list; unknown Xray tags are ignored.
 func buildDailyIncrementData(ctx context.Context, repo *storage.TrafficRepository, now time.Time) (dailyIncrementData, error) {
-	today := now.Format("2006-01-02")
-	yesterday := now.AddDate(0, 0, -1).Format("2006-01-02")
+	yesterdayAt := now.AddDate(0, 0, -1)
+	yesterday := yesterdayAt.Format("2006-01-02")
 	out := dailyIncrementData{Date: yesterday}
 
-	nodeBefore, err := repo.GetNodeTrafficSnapshots(ctx, yesterday)
+	nodeDaily, _, _, err := repo.ListDailyNodeTraffic(ctx, "today", yesterdayAt)
 	if err != nil {
-		return out, fmt.Errorf("load yesterday node snapshots: %w", err)
-	}
-	nodeAfter, err := repo.GetNodeTrafficSnapshots(ctx, today)
-	if err != nil {
-		return out, fmt.Errorf("load today node snapshots: %w", err)
+		return out, fmt.Errorf("load daily node traffic: %w", err)
 	}
 	servers, err := repo.ListRemoteServers(ctx)
 	if err != nil {
@@ -387,42 +384,63 @@ func buildDailyIncrementData(ctx context.Context, repo *storage.TrafficRepositor
 			nodeNames[key] = n.NodeName
 		}
 	}
-	type bytePair struct{ up, down int64 }
-	nodeBase := make(map[string]bytePair, len(nodeBefore))
-	for _, s := range nodeBefore {
-		if s.Type == "inbound" && !strings.EqualFold(strings.TrimSpace(s.Tag), "api") {
-			nodeBase[strconv.FormatInt(s.ServerID, 10)+"\x00"+s.Tag] = bytePair{s.Uplink, s.Downlink}
-		}
-	}
 	type usage struct {
 		name string
 		used int64
 	}
 	var nodeUsage []usage
-	for _, s := range nodeAfter {
+	for _, s := range nodeDaily {
 		if s.Type != "inbound" || strings.EqualFold(strings.TrimSpace(s.Tag), "api") {
-			continue
-		}
-		key := strconv.FormatInt(s.ServerID, 10) + "\x00" + s.Tag
-		base, ok := nodeBase[key]
-		if !ok || s.Date == nodeBeforeDate(nodeBefore, s.ServerID, s.Tag, s.Type) {
-			continue
-		}
-		up, down := s.Uplink-base.up, s.Downlink-base.down
-		if up < 0 {
-			up = 0
-		}
-		if down < 0 {
-			down = 0
-		}
-		used := up + down
-		if used <= 0 {
 			continue
 		}
 		serverName := serverNames[s.ServerID]
 		name := nodeNames[serverName+"\x00"+s.Tag]
+		// Only traffic attributable to an actual node-list entry is included.
 		if name == "" {
-			name = serverName + "/" + s.Tag
+			continue
+		}
+		used := s.Uplink + s.Downlink
+		if used <= 0 {
+			continue
+		}
+		nodeUsage = append(nodeUsage, usage{name: name, used: used})
+		out.NodeTotal += used
+	}
+
+	// External subscriptions have no Xray inbound tag. Their provider counters
+	// are sampled during sync and stored as daily deltas under the subscription.
+	externalDaily, err := repo.ListDailyExternalSubscriptionTraffic(ctx, yesterday)
+	if err != nil {
+		return out, fmt.Errorf("load external subscription daily traffic: %w", err)
+	}
+	externalSubs, err := repo.ListAllExternalSubscriptions(ctx)
+	if err != nil {
+		return out, fmt.Errorf("list external subscriptions for labels: %w", err)
+	}
+	externalByID := make(map[int64]storage.ExternalSubscription, len(externalSubs))
+	for _, sub := range externalSubs {
+		externalByID[sub.ID] = sub
+	}
+	for _, daily := range externalDaily {
+		sub, ok := externalByID[daily.ExternalSubscriptionID]
+		if !ok {
+			continue
+		}
+		var used int64
+		switch strings.ToLower(strings.TrimSpace(sub.TrafficMode)) {
+		case "upload":
+			used = daily.Uplink
+		case "download":
+			used = daily.Downlink
+		default:
+			used = daily.Uplink + daily.Downlink
+		}
+		if used <= 0 {
+			continue
+		}
+		name := sub.Name
+		if strings.TrimSpace(sub.Username) != "" {
+			name = sub.Name + " (" + sub.Username + ")"
 		}
 		nodeUsage = append(nodeUsage, usage{name: name, used: used})
 		out.NodeTotal += used
@@ -432,44 +450,20 @@ func buildDailyIncrementData(ctx context.Context, repo *storage.TrafficRepositor
 		out.NodeLines = append(out.NodeLines, fmt.Sprintf("• %s: %.2fGB", notify.EscapeMarkdown(n.name), float64(n.used)/(1024*1024*1024)))
 	}
 
-	// 用户用 email 级累计快照差分，避免用户在月度/手动重置套餐周期时 user_traffic 被清零。
-	emailBefore, err := repo.GetUserEmailTrafficSnapshots(ctx, yesterday)
+	// User increments use the weighted email ledger, which is independent of
+	// package/manual resets and already contains routed-account attribution.
+	emailDaily, _, _, err := repo.ListDailyEmailTraffic(ctx, "today", yesterdayAt)
 	if err != nil {
-		return out, fmt.Errorf("load yesterday user snapshots: %w", err)
-	}
-	emailAfter, err := repo.GetUserEmailTrafficSnapshots(ctx, today)
-	if err != nil {
-		return out, fmt.Errorf("load today user snapshots: %w", err)
-	}
-	attr, err := repo.BuildEmailAttributor(ctx)
-	if err != nil {
-		return out, fmt.Errorf("build user attribution: %w", err)
-	}
-	emailBase := make(map[string]storage.UserEmailTrafficSnapshot, len(emailBefore))
-	for _, s := range emailBefore {
-		emailBase[strconv.FormatInt(s.ServerID, 10)+"\x00"+s.Email] = s
+		return out, fmt.Errorf("load daily user traffic: %w", err)
 	}
 	userUsage := make(map[string]int64)
-	for _, s := range emailAfter {
-		key := strconv.FormatInt(s.ServerID, 10) + "\x00" + s.Email
-		base, ok := emailBase[key]
-		if !ok || s.Date == base.Date {
+	for _, s := range emailDaily {
+		if strings.TrimSpace(s.Username) == "" {
 			continue
 		}
-		up, down := s.Uplink-base.Uplink, s.Downlink-base.Downlink
-		if up < 0 {
-			up = 0
-		}
-		if down < 0 {
-			down = 0
-		}
-		attribution := attr.Classify(s.Email, s.ServerID)
-		if attribution.Username == "" {
-			continue
-		}
-		weighted := int64(math.Round(float64(up+down) * attr.EmailWeight(s.Email, s.ServerID)))
+		weighted := int64(math.Round(s.WeightedUplink + s.WeightedDownlink))
 		if weighted > 0 {
-			userUsage[attribution.Username] += weighted
+			userUsage[s.Username] += weighted
 		}
 	}
 	var users []usage
@@ -485,15 +479,6 @@ func buildDailyIncrementData(ctx context.Context, repo *storage.TrafficRepositor
 		out.UserLines = append(out.UserLines, fmt.Sprintf("• %s: %.2fGB", notify.EscapeMarkdown(u.name), float64(u.used)/(1024*1024*1024)))
 	}
 	return out, nil
-}
-
-func nodeBeforeDate(rows []storage.NodeTrafficSnapshot, serverID int64, tag, trafficType string) string {
-	for _, s := range rows {
-		if s.ServerID == serverID && s.Tag == tag && s.Type == trafficType {
-			return s.Date
-		}
-	}
-	return ""
 }
 
 func sendDailyTrafficNotification(ctx context.Context, repo *storage.TrafficRepository, n *notify.Notifier) {

@@ -6469,8 +6469,20 @@ func (r *TrafficRepository) UpdateExternalSubscription(ctx context.Context, sub 
 		trafficMode = "both"
 	}
 
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin external subscription update: %w", err)
+	}
+	defer tx.Rollback()
+	var oldUpload, oldDownload int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(upload,0),COALESCE(download,0) FROM external_subscriptions WHERE id=? AND username=?`, sub.ID, username).Scan(&oldUpload, &oldDownload); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrExternalSubscriptionNotFound
+		}
+		return fmt.Errorf("read external subscription traffic: %w", err)
+	}
 	const stmt = `UPDATE external_subscriptions SET name = ?, url = ?, user_agent = ?, node_count = ?, last_sync_at = ?, upload = ?, download = ?, total = ?, expire = ?, traffic_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND username = ?`
-	result, err := r.db.ExecContext(ctx, stmt, name, url, userAgent, sub.NodeCount, sub.LastSyncAt, sub.Upload, sub.Download, sub.Total, sub.Expire, trafficMode, sub.ID, username)
+	result, err := tx.ExecContext(ctx, stmt, name, url, userAgent, sub.NodeCount, sub.LastSyncAt, sub.Upload, sub.Download, sub.Total, sub.Expire, trafficMode, sub.ID, username)
 	if err != nil {
 		return fmt.Errorf("update external subscription: %w", err)
 	}
@@ -6483,8 +6495,10 @@ func (r *TrafficRepository) UpdateExternalSubscription(ctx context.Context, sub 
 	if rows == 0 {
 		return ErrExternalSubscriptionNotFound
 	}
-
-	return nil
+	if err := addDailyExternalSubscriptionTraffic(ctx, tx, trafficLedgerDate(time.Now()), sub.ID, oldUpload, oldDownload, sub.Upload, sub.Download); err != nil {
+		return fmt.Errorf("record external subscription daily traffic: %w", err)
+	}
+	return tx.Commit()
 }
 
 // 删除外部订阅。
@@ -6581,8 +6595,20 @@ func (r *TrafficRepository) UpdateExternalSubscriptionByID(ctx context.Context, 
 	if trafficMode == "" {
 		trafficMode = "both"
 	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin external subscription update: %w", err)
+	}
+	defer tx.Rollback()
+	var oldUpload, oldDownload int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(upload,0),COALESCE(download,0) FROM external_subscriptions WHERE id=?`, sub.ID).Scan(&oldUpload, &oldDownload); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrExternalSubscriptionNotFound
+		}
+		return fmt.Errorf("read external subscription traffic: %w", err)
+	}
 	const stmt = `UPDATE external_subscriptions SET name = ?, url = ?, user_agent = ?, node_count = ?, last_sync_at = ?, upload = ?, download = ?, total = ?, expire = ?, traffic_mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-	result, err := r.db.ExecContext(ctx, stmt, name, url, userAgent, sub.NodeCount, sub.LastSyncAt, sub.Upload, sub.Download, sub.Total, sub.Expire, trafficMode, sub.ID)
+	result, err := tx.ExecContext(ctx, stmt, name, url, userAgent, sub.NodeCount, sub.LastSyncAt, sub.Upload, sub.Download, sub.Total, sub.Expire, trafficMode, sub.ID)
 	if err != nil {
 		return fmt.Errorf("update external subscription by id: %w", err)
 	}
@@ -6590,7 +6616,10 @@ func (r *TrafficRepository) UpdateExternalSubscriptionByID(ctx context.Context, 
 	if rows == 0 {
 		return ErrExternalSubscriptionNotFound
 	}
-	return nil
+	if err := addDailyExternalSubscriptionTraffic(ctx, tx, trafficLedgerDate(time.Now()), sub.ID, oldUpload, oldDownload, sub.Upload, sub.Download); err != nil {
+		return fmt.Errorf("record external subscription daily traffic: %w", err)
+	}
+	return tx.Commit()
 }
 
 // DeleteExternalSubscriptionByID 不限 owner 按 ID 删除(仅管理员路径使用)。级联清 proxy_provider_configs。
