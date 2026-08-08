@@ -1017,7 +1017,8 @@ func main() {
 	mux.Handle("/api/public/license-badge", handler.NewLicenseBadgePublicHandler(repo, licenseManager))
 	mux.Handle("/api/admin/system-settings/license-badge", auth.RequireAdmin(tokenStore, userRepo, handler.NewLicenseBadgeDisplayHandler(repo)))
 
-	// 真探针数据的内存 ring(cpu/mem/disk/ping,来自 agent 上报)。用户选「仅内存实时滚动」不建表。
+	// 真探针数据的内存 ring(cpu/mem/disk/ping,来自 agent 上报)。查询热路径不建时序表，
+	// 仅将紧凑的 24 小时 ring 定时落盘，避免主控重启后曲线清空。
 	// 单例:读侧给 ProbePublicHandler,写侧 P3 注入 remoteWSHandler。
 	// capN=1440(1 分钟间隔约 1 天窗口):伪装页延迟折线图/24 小时色块条据此回溯。
 	// 内存量级:1440 点 × 16B × 目标数(≤30) × 服务器数,几十台机也就几 MB,可接受。
@@ -1033,7 +1034,7 @@ func main() {
 		t := time.NewTicker(5 * time.Minute)
 		defer t.Stop()
 		for range t.C {
-			probeMetricsStore.Evict(10 * time.Minute) // 掉线 10min 的 server 清出,防内存无界
+			probeMetricsStore.Evict(25 * time.Hour) // 保留完整 24h 历史，超窗服务器才清理
 		}
 	}()
 
@@ -1423,6 +1424,7 @@ func main() {
 	}
 
 	collectorCtx, stopCollector := context.WithCancel(context.Background())
+	handler.StartProbeMetricsPersistence(collectorCtx, probeMetricsStore, filepath.Join(dataDir, "probe-metrics.json"))
 	returnRouteTester.Start(collectorCtx)
 	returnRouteTester.LogTargets()
 	if err := tgBotManager.Restart(collectorCtx); err != nil {

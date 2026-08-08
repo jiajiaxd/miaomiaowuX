@@ -201,7 +201,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	}
 
 	servers, _ := h.repo.ListRemoteServers(ctx)
-	dailyTraffic := h.loadDailyTraffic(ctx, servers, 30)
+	dailyTraffic := h.loadDailyTraffic(ctx, servers)
 	var returnRoutes map[int64][]storage.ServerReturnRoute
 	if showReturnRoute {
 		ids := make([]int64, 0, len(idSet))
@@ -308,17 +308,19 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	return payload, nil
 }
 
-// loadDailyTraffic caches the compact 30-day ledger projection for one minute.
+// loadDailyTraffic caches the current reset-cycle ledger projection for one minute.
 // buildPayload is shared by HTTP polling and WS broadcasting, so querying the
 // ledger on every 5-second payload would create needless database read load.
-func (h *ProbePublicHandler) loadDailyTraffic(ctx context.Context, servers []storage.RemoteServer, days int) map[int64][]probeDailyTraffic {
+func (h *ProbePublicHandler) loadDailyTraffic(ctx context.Context, servers []storage.RemoteServer) map[int64][]probeDailyTraffic {
 	h.dailyMu.Lock()
 	defer h.dailyMu.Unlock()
 	if h.dailyTraffic != nil && time.Since(h.dailyAt) < time.Minute {
 		return h.dailyTraffic
 	}
 	now := time.Now()
-	rows, err := h.repo.ListServerDailyTraffic(ctx, days, now)
+	// 月度重置周期最长 31 天；多取几天覆盖跨月与 29/30/31 日夹月末。
+	const queryDays = 35
+	rows, err := h.repo.ListServerDailyTraffic(ctx, queryDays, now)
 	if err != nil {
 		return h.dailyTraffic
 	}
@@ -332,9 +334,13 @@ func (h *ProbePublicHandler) loadDailyTraffic(ctx context.Context, servers []sto
 		}
 	}
 	out := make(map[int64][]probeDailyTraffic, len(servers))
-	start := now.AddDate(0, 0, -(days - 1))
 	for _, server := range servers {
 		serverID, byDate := server.ID, values[server.ID]
+		start := now.AddDate(0, 0, -(queryDays - 1))
+		if server.TrafficResetDay >= 1 && server.TrafficResetDay <= 31 {
+			start = prevResetDate(now, server.TrafficResetDay)
+		}
+		days := int(dayStart(now).Sub(dayStart(start)).Hours()/24) + 1
 		list := make([]probeDailyTraffic, 0, days)
 		for i := 0; i < days; i++ {
 			date := start.AddDate(0, 0, i).Format("2006-01-02")

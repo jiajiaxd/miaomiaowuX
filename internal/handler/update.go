@@ -115,6 +115,14 @@ func NewUpdateApplyHandler() http.Handler {
 		logger.Info("[系统更新] 开始下载更新", "url", info.DownloadURL)
 		tempFile, err := downloadBinary(info.DownloadURL)
 		if err != nil {
+			// CDN 的 version.json 可能先于大文件完成边缘同步。此时同版本直接
+			// 回退 GitHub Release 资产，不能让用户只能等待或手工安装。
+			if gh, ghErr := checkLatestVersionGitHub(channel); ghErr == nil && gh.LatestVersion == info.LatestVersion && gh.DownloadURL != "" && gh.DownloadURL != info.DownloadURL {
+				logger.Info("[系统更新] CDN 下载失败，回退 GitHub Release", "error", err.Error(), "url", gh.DownloadURL)
+				tempFile, err = downloadBinary(gh.DownloadURL)
+			}
+		}
+		if err != nil {
 			writeUpdateError(w, http.StatusInternalServerError, fmt.Errorf("下载失败: %w", err))
 			return
 		}
@@ -232,6 +240,23 @@ func NewUpdateApplySSEHandler() http.Handler {
 			lastProgress = 0
 			sendProgress("downloading", 0, "直接下载失败，正在使用代理重试...")
 		})
+		if err != nil {
+			if gh, ghErr := checkLatestVersionGitHub(channel); ghErr == nil && gh.LatestVersion == info.LatestVersion && gh.DownloadURL != "" && gh.DownloadURL != info.DownloadURL {
+				lastProgress = 0
+				sendProgress("downloading", 0, "CDN 尚未同步，正在从 GitHub Release 重试...")
+				logger.Info("[系统更新] CDN 下载失败，回退 GitHub Release", "error", err.Error(), "url", gh.DownloadURL)
+				tempFile, err = downloadBinaryWithProgressAndRetry(gh.DownloadURL, func(downloaded, total int64) {
+					progress := int(downloaded * 100 / total)
+					if progress >= lastProgress+5 || progress == 100 {
+						lastProgress = progress
+						sendProgress("downloading", progress, fmt.Sprintf("正在下载... %d%%", progress))
+					}
+				}, func(string) {
+					lastProgress = 0
+					sendProgress("downloading", 0, "GitHub 直连失败，正在使用代理重试...")
+				})
+			}
+		}
 		if err != nil {
 			sendProgress("error", 0, fmt.Sprintf("下载失败: %v", err))
 			return

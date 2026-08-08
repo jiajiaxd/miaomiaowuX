@@ -4920,6 +4920,10 @@ func (r *TrafficRepository) UpdateUserCustomShortCode(ctx context.Context, usern
 	if _, err := r.GetOrCreateUserToken(ctx, username); err != nil {
 		return fmt.Errorf("ensure user token exists: %w", err)
 	}
+	var previous string
+	if err := r.db.QueryRowContext(ctx, `SELECT COALESCE(custom_user_short_code, '') FROM user_tokens WHERE username = ?`, username).Scan(&previous); err != nil {
+		return fmt.Errorf("read existing user custom short code: %w", err)
+	}
 
 	res, err := r.db.ExecContext(ctx, `UPDATE user_tokens SET custom_user_short_code = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`, code, username)
 	if err != nil {
@@ -4935,7 +4939,31 @@ func (r *TrafficRepository) UpdateUserCustomShortCode(ctx context.Context, usern
 	if affected == 0 {
 		return ErrUserNotFound
 	}
+	if strings.TrimSpace(previous) != code {
+		if err := r.resetUserShortCode(ctx, username); err != nil {
+			return fmt.Errorf("rotate user short code: %w", err)
+		}
+	}
 	return nil
+}
+
+func (r *TrafficRepository) resetUserShortCode(ctx context.Context, username string) error {
+	const maxRetries = 10
+	for i := 0; i < maxRetries; i++ {
+		code, err := generateUserShortCode()
+		if err != nil {
+			return err
+		}
+		_, err = r.db.ExecContext(ctx, `UPDATE user_tokens SET user_short_code = ?, updated_at = CURRENT_TIMESTAMP WHERE username = ?`, code, username)
+		if err == nil {
+			return nil
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			continue
+		}
+		return err
+	}
+	return errors.New("failed to generate unique user short code after retries")
 }
 
 func (r *TrafficRepository) GetUserCustomShortCode(ctx context.Context, username string) (string, error) {

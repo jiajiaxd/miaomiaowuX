@@ -301,6 +301,10 @@ func (r *TrafficRepository) UpdateSubscribeFile(ctx context.Context, file Subscr
 	if file.ID <= 0 {
 		return SubscribeFile{}, errors.New("subscribe file id is required")
 	}
+	var previousCustomCode string
+	if err := r.db.QueryRowContext(ctx, `SELECT COALESCE(custom_short_code, '') FROM subscribe_files WHERE id = ?`, file.ID).Scan(&previousCustomCode); err != nil {
+		return SubscribeFile{}, fmt.Errorf("read existing custom short code: %w", err)
+	}
 
 	file.Name = strings.TrimSpace(file.Name)
 	file.Description = strings.TrimSpace(file.Description)
@@ -358,6 +362,13 @@ func (r *TrafficRepository) UpdateSubscribeFile(ctx context.Context, file Subscr
 	}
 	if affected == 0 {
 		return SubscribeFile{}, ErrSubscribeFileNotFound
+	}
+	// 自定义链接属于可轮换凭据。修改后同步轮换隐藏的自动短码，确保修改前
+	// 显示/复制过的旧地址不再能通过 file_short_code 回退继续访问。
+	if strings.TrimSpace(previousCustomCode) != strings.TrimSpace(file.CustomShortCode) {
+		if err := r.resetFileShortCode(ctx, file.ID); err != nil {
+			return SubscribeFile{}, fmt.Errorf("rotate file short code: %w", err)
+		}
 	}
 	return r.GetSubscribeFileByID(ctx, file.ID)
 }

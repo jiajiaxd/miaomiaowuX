@@ -1,8 +1,13 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"log"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -166,6 +171,31 @@ type ProbeMetricsStore struct {
 	capN int                           // 每目标原始点保留上界
 }
 
+type probeAggSlotDisk struct {
+	Slot int64 `json:"slot"`
+	Sum  int64 `json:"sum"`
+	Cnt  int64 `json:"count"`
+	Fail int64 `json:"fail"`
+}
+
+type probeServerMetricsDisk struct {
+	Sys         ProbeSysSnapshot               `json:"sys"`
+	HasSys      bool                           `json:"has_sys"`
+	Latency     map[string][]probeLatencyPoint `json:"latency"`
+	Agg         map[string][]probeAggSlotDisk  `json:"aggregate"`
+	LastAt      map[string]int64               `json:"last_at"`
+	System      []probeSystemSlot              `json:"system"`
+	LastNetAt   int64                          `json:"last_net_at"`
+	LastNetUp   int64                          `json:"last_net_up"`
+	LastNetDown int64                          `json:"last_net_down"`
+	UpdatedAt   int64                          `json:"updated_at"`
+}
+
+type probeMetricsDisk struct {
+	Version int                               `json:"version"`
+	Servers map[int64]*probeServerMetricsDisk `json:"servers"`
+}
+
 // NewProbeMetricsStore capN 为每目标原始点环形容量(仅用于算当前延迟;
 // 历史曲线走固定 288 槽的 5 分钟聚合层,与该参数无关)。
 func NewProbeMetricsStore(capN int) *ProbeMetricsStore {
@@ -173,6 +203,147 @@ func NewProbeMetricsStore(capN int) *ProbeMetricsStore {
 		capN = probeRawCapN
 	}
 	return &ProbeMetricsStore{data: make(map[int64]*probeServerMetrics), capN: capN}
+}
+
+// StartProbeMetricsPersistence restores the compact 24-hour rings and writes
+// them atomically once a minute. The hot path remains memory-only; this file is
+// a restart checkpoint rather than a query database.
+func StartProbeMetricsPersistence(ctx context.Context, s *ProbeMetricsStore, path string) {
+	if s == nil || strings.TrimSpace(path) == "" {
+		return
+	}
+	if err := s.loadCheckpoint(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("[Probe Metrics] restore checkpoint failed: %v", err)
+	}
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := s.saveCheckpoint(path); err != nil {
+					log.Printf("[Probe Metrics] save checkpoint failed: %v", err)
+				}
+			case <-ctx.Done():
+				if err := s.saveCheckpoint(path); err != nil {
+					log.Printf("[Probe Metrics] final checkpoint failed: %v", err)
+				}
+				return
+			}
+		}
+	}()
+}
+
+func (s *ProbeMetricsStore) checkpoint() probeMetricsDisk {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := probeMetricsDisk{Version: 1, Servers: make(map[int64]*probeServerMetricsDisk, len(s.data))}
+	for id, m := range s.data {
+		d := &probeServerMetricsDisk{
+			Sys: m.sys, HasSys: m.hasSys, Latency: m.latency, LastAt: m.lastAt,
+			System: m.system, LastNetAt: m.lastNetAt, LastNetUp: m.lastNetUp,
+			LastNetDown: m.lastNetDown, UpdatedAt: m.updatedAt,
+			Agg: make(map[string][]probeAggSlotDisk, len(m.agg)),
+		}
+		for key, slots := range m.agg {
+			converted := make([]probeAggSlotDisk, len(slots))
+			for i, slot := range slots {
+				converted[i] = probeAggSlotDisk{Slot: slot.Slot, Sum: slot.Sum, Cnt: slot.Cnt, Fail: slot.Fail}
+			}
+			d.Agg[key] = converted
+		}
+		out.Servers[id] = d
+	}
+	return out
+}
+
+func (s *ProbeMetricsStore) saveCheckpoint(path string) error {
+	raw, err := json.Marshal(s.checkpoint())
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".probe-metrics-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err = tmp.Chmod(0o600); err == nil {
+		_, err = tmp.Write(raw)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if closeErr := tmp.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err == nil {
+		return nil
+	}
+	// Windows 不允许 Rename 覆盖已有文件；主控也支持 Windows 构建。
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+func (s *ProbeMetricsStore) loadCheckpoint(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var disk probeMetricsDisk
+	if err := json.Unmarshal(raw, &disk); err != nil {
+		return err
+	}
+	cutoff := time.Now().Add(-24 * time.Hour).Unix()
+	restored := make(map[int64]*probeServerMetrics, len(disk.Servers))
+	for id, d := range disk.Servers {
+		if d == nil || d.UpdatedAt < cutoff {
+			continue
+		}
+		m := &probeServerMetrics{
+			sys: d.Sys, hasSys: d.HasSys, latency: make(map[string][]probeLatencyPoint),
+			agg: make(map[string][]probeAggSlot), lastAt: d.LastAt, system: d.System,
+			lastNetAt: d.LastNetAt, lastNetUp: d.LastNetUp, lastNetDown: d.LastNetDown,
+			updatedAt: d.UpdatedAt,
+		}
+		if m.lastAt == nil {
+			m.lastAt = make(map[string]int64)
+		}
+		for key, points := range d.Latency {
+			if len(points) > s.capN {
+				points = points[len(points)-s.capN:]
+			}
+			m.latency[key] = points
+		}
+		for key, slots := range d.Agg {
+			if len(slots) > probeAggMaxSlots {
+				slots = slots[len(slots)-probeAggMaxSlots:]
+			}
+			converted := make([]probeAggSlot, 0, len(slots))
+			for _, slot := range slots {
+				if slot.Slot >= cutoff {
+					converted = append(converted, probeAggSlot{Slot: slot.Slot, Sum: slot.Sum, Cnt: slot.Cnt, Fail: slot.Fail})
+				}
+			}
+			m.agg[key] = converted
+		}
+		if len(m.system) > probeAggMaxSlots {
+			m.system = m.system[len(m.system)-probeAggMaxSlots:]
+		}
+		restored[id] = m
+	}
+	s.mu.Lock()
+	s.data = restored
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *ProbeMetricsStore) ensure(serverID int64) *probeServerMetrics {
