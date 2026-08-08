@@ -22,9 +22,21 @@ const probeExternalTokenHeader = "X-MMwx-Probe-Token"
 func RequireProbeExternalAccess(repo *storage.TrafficRepository, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		internalOn, externalOn := probeChannelEnabled(repo, r)
-		if (externalOn && validProbeExternalToken(repo, r)) ||
-			(internalOn && probeSameOriginRequest(repo, r)) {
+		// A valid Worker token always selects the external channel. Check it
+		// before Origin because a reverse proxy may add an Origin header.
+		if externalOn && validProbeExternalToken(repo, r) {
 			next.ServeHTTP(w, r)
+			return
+		}
+		// Same-origin browser traffic is the built-in panel channel. Do not let
+		// the legacy public-external fallback below turn on the master homepage
+		// when only the external probe switch is enabled.
+		if probeSameOriginRequest(repo, r) {
+			if internalOn {
+				next.ServeHTTP(w, r)
+				return
+			}
+			http.NotFound(w, r)
 			return
 		}
 		// 未开启接口保护时，外置探针可按原有公开接口方式访问；内置开关不会
