@@ -83,7 +83,8 @@ func (h *TrafficSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 	isAdmin := haveUser && user.Role == storage.RoleAdmin
 
 	var totalLimit, totalUsed, unlimitedUsed int64
-	// 管理员历史趋势保持全服务器口径；include_in_traffic_stats 只控制顶部四张卡片。
+	// 累计快照仍保存全服务器总量，作为旧版本兼容数据；当前每日趋势直接从
+	// per-server 日账本按 include_in_traffic_stats 动态筛选。
 	var snapshotLimit, snapshotUsed int64
 	// serverListOK 跟踪 ListRemoteServers 是否成功 — 后面 recordSnapshot 用它兜底,
 	// 防止"DB 临时报错 → 全 0 → ON CONFLICT 覆盖正确历史"事故(实际 2026-05-31 已发生)。
@@ -428,7 +429,16 @@ func (h *TrafficSummaryHandler) loadHistory(ctx context.Context, days int) ([]tr
 	// 旧实现优先用累计快照做相邻日期差分；新安装的第一份快照只能当基线，
 	// 即使日账本里已有安装首日/次日的真实流量，图上也要等到第二份快照后才
 	// 出现一个点，表现为“前两天消失、只剩今天”。
-	if usages, err := h.loadHistoryFromDailyLedger(ctx, days); err == nil && len(usages) > 0 {
+	selectionIsAll := true
+	if servers, err := h.repo.ListRemoteServers(ctx); err == nil {
+		for _, server := range servers {
+			if !server.IncludeInTrafficStats {
+				selectionIsAll = false
+				break
+			}
+		}
+	}
+	if usages, err := h.loadHistoryFromDailyLedger(ctx, days); err == nil && (len(usages) > 0 || !selectionIsAll) {
 		return usages, nil
 	} else if err != nil {
 		logger.Warn("[流量统计] 日账本读取失败,回落快照差分", "error", err)
@@ -436,7 +446,7 @@ func (h *TrafficSummaryHandler) loadHistory(ctx context.Context, days int) ([]tr
 
 	// 兼容升级前没有日账本的历史库：先尝试 per-server 快照差分，再回落旧的
 	// traffic_records 总量差分。
-	if usages, err := h.loadHistoryFromSnapshots(ctx, days); err == nil && len(usages) > 0 {
+	if usages, err := h.loadHistoryFromSnapshots(ctx, days); err == nil && (len(usages) > 0 || !selectionIsAll) {
 		return usages, nil
 	} else if err != nil {
 		logger.Warn("[流量统计] 快照差分失败,回落总量差分", "error", err)
@@ -515,7 +525,9 @@ func (h *TrafficSummaryHandler) loadHistoryFromDailyLedger(ctx context.Context, 
 	}
 	modes := make(map[int64]string, len(servers))
 	for _, server := range servers {
-		modes[server.ID] = server.TrafficStatsMode
+		if server.IncludeInTrafficStats {
+			modes[server.ID] = server.TrafficStatsMode
+		}
 	}
 	return aggregateDailyLedgerHistory(rows, modes, days), nil
 }
@@ -523,7 +535,11 @@ func (h *TrafficSummaryHandler) loadHistoryFromDailyLedger(ctx context.Context, 
 func aggregateDailyLedgerHistory(rows []storage.ServerDailyTraffic, modes map[int64]string, days int) []trafficDailyUsage {
 	perDate := make(map[string]float64, days+1)
 	for _, row := range rows {
-		perDate[row.Date] += applyTrafficMode(float64(row.Uplink), float64(row.Downlink), modes[row.ServerID])
+		mode, selected := modes[row.ServerID]
+		if !selected {
+			continue
+		}
+		perDate[row.Date] += applyTrafficMode(float64(row.Uplink), float64(row.Downlink), mode)
 	}
 	dates := make([]string, 0, len(perDate))
 	for date := range perDate {
@@ -714,6 +730,14 @@ func (h *TrafficSummaryHandler) loadHistoryFromSnapshots(ctx context.Context, da
 	if len(rows) == 0 {
 		return nil, nil
 	}
+	servers, err := h.repo.ListRemoteServers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	selected := make(map[int64]bool, len(servers))
+	for _, server := range servers {
+		selected[server.ID] = server.IncludeInTrafficStats
+	}
 
 	// serverID -> 上一天的累计值。rows 已按 (server_id, date) 排好序。
 	prev := make(map[int64]int64, 16)
@@ -721,6 +745,9 @@ func (h *TrafficSummaryHandler) loadHistoryFromSnapshots(ctx context.Context, da
 	perDate := make(map[string]int64, days+1)
 
 	for _, r := range rows {
+		if !selected[r.ServerID] {
+			continue
+		}
 		if !seen[r.ServerID] {
 			// 该服务器的第一条只作基线,不产生增量 —— 否则会把它的历史累计量
 			// 一次性算进这一天,又是一根假尖峰。

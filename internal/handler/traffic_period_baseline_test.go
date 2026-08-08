@@ -52,3 +52,17 @@ func TestDailyLedgerHistoryHonorsServerTrafficMode(t *testing.T) {
 		t.Fatalf("traffic modes were ignored: %#v", got)
 	}
 }
+
+func TestDailyLedgerHistoryIncludesOnlySelectedServers(t *testing.T) {
+	const gb = int64(1 << 30)
+	rows := []storage.ServerDailyTraffic{
+		{ServerID: 1, Date: "2026-08-07", Uplink: 2 * gb, Downlink: 3 * gb},
+		{ServerID: 2, Date: "2026-08-07", Uplink: 40 * gb, Downlink: 50 * gb},
+	}
+	// Presence in the modes map is also the traffic-summary selection. Server 2
+	// has ledger data but is deliberately absent and must not affect the chart.
+	got := aggregateDailyLedgerHistory(rows, map[int64]string{1: "both"}, 30)
+	if len(got) != 1 || got[0].UsedGB == nil || *got[0].UsedGB != 5 {
+		t.Fatalf("unselected server leaked into daily history: %#v", got)
+	}
+}
