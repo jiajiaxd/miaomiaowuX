@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -32,10 +33,16 @@ func DeployCertFiles(certPEM, keyPEM, certPath, keyPath string) error {
 
 // 向 nginx 发送重新加载信号。
 func ReloadNginx() error {
+	return ReloadNginxContext(context.Background())
+}
+
+// ReloadNginxContext reloads nginx without allowing a broken service manager
+// or init script to block the caller forever.
+func ReloadNginxContext(ctx context.Context) error {
 	// 首先尝试常见的 nginx 二进制路径，然后回退到 systemctl
 	for _, nginxBin := range []string{"/usr/local/nginx/sbin/nginx", "nginx"} {
 		if path, err := exec.LookPath(nginxBin); err == nil {
-			cmd := exec.Command(path, "-s", "reload")
+			cmd := exec.CommandContext(ctx, path, "-s", "reload")
 			reloadOutput, reloadErr := cmd.CombinedOutput()
 			if reloadErr == nil {
 				return nil
@@ -44,8 +51,8 @@ func ReloadNginx() error {
 			// nginx.pid 由运行中的 master 进程创建，不能手工伪造。reload 失败且
 			// systemd 确认服务未运行时，按首次部署处理并启动服务。
 			if systemctl, serr := exec.LookPath("systemctl"); serr == nil {
-				if activeErr := exec.Command(systemctl, "is-active", "--quiet", "nginx").Run(); activeErr != nil {
-					if _, startErr := exec.Command(systemctl, "start", "nginx").CombinedOutput(); startErr != nil {
+				if activeErr := exec.CommandContext(ctx, systemctl, "is-active", "--quiet", "nginx").Run(); activeErr != nil {
+					if _, startErr := exec.CommandContext(ctx, systemctl, "start", "nginx").CombinedOutput(); startErr != nil {
 						// 容器里可能装有 systemctl 二进制但没有运行 systemd；继续尝试
 						// 裸 nginx 启动，最终错误由下面的启动命令给出。
 					} else {
@@ -59,14 +66,14 @@ func ReloadNginx() error {
 			}
 
 			// 无 systemd（如容器）且没有运行中的 master 时，直接启动 nginx。
-			if output, startErr := exec.Command(path).CombinedOutput(); startErr != nil {
+			if output, startErr := exec.CommandContext(ctx, path).CombinedOutput(); startErr != nil {
 				return fmt.Errorf("nginx start after reload failed: %s: %w", string(output), startErr)
 			}
 			return nil
 		}
 	}
 	// 后备：systemctl
-	cmd := exec.Command("systemctl", "reload", "nginx")
+	cmd := exec.CommandContext(ctx, "systemctl", "reload", "nginx")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("nginx reload via systemctl: %s: %w", string(output), err)
 	}
@@ -75,7 +82,11 @@ func ReloadNginx() error {
 
 // RestartXray通过systemctl重新启动xray服务。
 func RestartXray() error {
-	cmd := exec.Command("systemctl", "restart", "xray")
+	return RestartXrayContext(context.Background())
+}
+
+func RestartXrayContext(ctx context.Context) error {
+	cmd := exec.CommandContext(ctx, "systemctl", "restart", "xray")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("xray restart: %s: %w", string(output), err)
 	}
@@ -85,20 +96,24 @@ func RestartXray() error {
 // 部署写入证书文件并可选择重新加载服务。
 // reloadTarget：“nginx”、“xray”、“两者”或“无”。
 func Deploy(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
+	return DeployContext(context.Background(), certPEM, keyPEM, certPath, keyPath, reloadTarget)
+}
+
+func DeployContext(ctx context.Context, certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
 	if err := DeployCertFiles(certPEM, keyPEM, certPath, keyPath); err != nil {
 		return err
 	}
 
 	switch reloadTarget {
 	case "nginx":
-		return ReloadNginx()
+		return ReloadNginxContext(ctx)
 	case "xray":
-		return RestartXray()
+		return RestartXrayContext(ctx)
 	case "both":
-		if err := ReloadNginx(); err != nil {
+		if err := ReloadNginxContext(ctx); err != nil {
 			return err
 		}
-		return RestartXray()
+		return RestartXrayContext(ctx)
 	}
 	return nil
 }

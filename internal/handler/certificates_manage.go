@@ -1181,6 +1181,50 @@ func (h *CertificateHandler) deployToAllRemotes(domain, certPEM, keyPEM, certPat
 	log.Printf("[Certificate] Initiated deploy to %d remote server(s) for %s", len(servers), domain)
 }
 
+type certificateDeployTargetResult struct {
+	Target  string `json:"target"`
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
+}
+
+// deployToAllRemotesAndWait deploys concurrently and returns one confirmed
+// result per Agent. Manual deployment uses this path so failures are visible to
+// the operator instead of being lost in background logs.
+func (h *CertificateHandler) deployToAllRemotesAndWait(ctx context.Context, domain, certPEM, keyPEM, certPath, keyPath, reloadTarget string) []certificateDeployTargetResult {
+	servers, err := h.repo.ListRemoteServers(ctx)
+	if err != nil {
+		return []certificateDeployTargetResult{{Target: "远程服务器列表", Error: err.Error()}}
+	}
+	payload := WSCertDeployPayload{
+		Domain:   domain,
+		CertPEM:  certPEM,
+		KeyPEM:   keyPEM,
+		CertPath: filepath.Join(filepath.Dir(certPath), certDeployFilename(domain)+filepath.Ext(certPath)),
+		KeyPath:  filepath.Join(filepath.Dir(keyPath), certDeployFilename(domain)+filepath.Ext(keyPath)),
+		Reload:   reloadTarget,
+	}
+	results := make([]certificateDeployTargetResult, len(servers))
+	var wg sync.WaitGroup
+	for i := range servers {
+		i, server := i, servers[i]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result := certificateDeployTargetResult{Target: server.Name}
+			deployCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if err := h.deployToRemoteServerSync(deployCtx, &server, payload); err != nil {
+				result.Error = err.Error()
+			} else {
+				result.Success = true
+			}
+			results[i] = result
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
 // 通过 HTTP POST 将证书推送到代理。
 // 走 buildAgentURLCandidates 的 v4-first → v6-fallback 候选清单,消灭旧的 strings.LastIndex 截断 bug。
 func (h *CertificateHandler) deployRemoteCertificateHTTP(ctx context.Context, server *storage.RemoteServer, payload WSCertDeployPayload) error {
@@ -1249,15 +1293,40 @@ func (h *CertificateHandler) DeployCertificate(w http.ResponseWriter, r *http.Re
 		log.Printf("[Certificate] UpdateCertificate deploy settings failed: %v", err)
 	}
 
-	// 本地部署（主）
-	if err := acme.Deploy(cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget); err != nil {
-		log.Printf("[Certificate] Local deploy failed for %s: %v", cert.Domain, err)
+	// 本机 reload/systemctl 在异常环境中可能永久阻塞。限制为 20 秒；远程
+	// Agent 并发部署且逐台确认，整个请求最长约 30 秒而不是按服务器数量累加。
+	results := make([]certificateDeployTargetResult, 0, 1)
+	batchCtx, batchCancel := context.WithTimeout(r.Context(), 35*time.Second)
+	defer batchCancel()
+	remoteResults := make(chan []certificateDeployTargetResult, 1)
+	go func() {
+		remoteResults <- h.deployToAllRemotesAndWait(batchCtx, cert.Domain, cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget)
+	}()
+	localCtx, localCancel := context.WithTimeout(batchCtx, 20*time.Second)
+	localErr := acme.DeployContext(localCtx, cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget)
+	localCancel()
+	localResult := certificateDeployTargetResult{Target: "主服务器", Success: localErr == nil}
+	if localErr != nil {
+		localResult.Error = localErr.Error()
+		log.Printf("[Certificate] Local deploy failed for %s: %v", cert.Domain, localErr)
 	}
+	results = append(results, localResult)
+	confirmedRemotes := <-remoteResults
+	results = append(results, confirmedRemotes...)
 
-	// 部署到所有远程服务器
-	h.deployToAllRemotes(cert.Domain, cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget)
-
-	respondJSON(w, http.StatusOK, map[string]any{"success": true, "message": "证书已部署到主服务器和所有远程服务器"})
+	failed := make([]string, 0)
+	for _, result := range results {
+		if !result.Success {
+			failed = append(failed, result.Target+": "+result.Error)
+		}
+	}
+	if len(failed) > 0 {
+		respondJSON(w, http.StatusOK, map[string]any{
+			"success": false, "message": "部分目标部署失败：" + strings.Join(failed, "；"), "results": results,
+		})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"success": true, "message": "证书已部署到主服务器和所有远程服务器", "results": results})
 }
 
 // DeployAutoDeployCertificates 将所有 auto_deploy 证书部署到特定的远程服务器。
