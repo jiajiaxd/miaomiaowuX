@@ -64,6 +64,8 @@ func (h *TrafficHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleNodeTotals(w, r)
 	case path == "user-connections":
 		h.handleUserConnections(w, r)
+	case path == "node-connections":
+		h.handleNodeConnections(w, r)
 	case path == "period":
 		h.handleLedgerPeriod(w, r)
 	default:
@@ -688,6 +690,17 @@ func (h *TrafficHandler) handleUserConnections(w http.ResponseWriter, r *http.Re
 		return
 	}
 	h.writeJSON(w, http.StatusOK, map[string]any{"success": true, "connections": AggregateUserConnCounts()})
+}
+
+func (h *TrafficHandler) handleNodeConnections(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	totals, users := AggregateNodeConnCounts()
+	h.writeJSON(w, http.StatusOK, map[string]any{
+		"success": true, "connections": totals, "users": users,
+	})
 }
 
 // emailBaseline 加载 <= date 的 email 级 baseline,key = "<server_id>|<email>"。

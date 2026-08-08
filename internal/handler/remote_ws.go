@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -115,6 +116,8 @@ type WSTrafficPayload struct {
 	UserSpeeds  map[string]int64    `json:"user_speeds,omitempty"`
 	// ConnCounts 每 group("<user>|<物理节点ID>")当前并发连接数;主控存内存、按用户聚合供用户视图展示。
 	ConnCounts map[string]int64 `json:"conn_counts,omitempty"`
+	// NodeConnCounts 按实际节点统计(group="<user>|<nodeID>")，与用于共享配额的 ConnCounts 分离。
+	NodeConnCounts map[string]int64 `json:"node_conn_counts,omitempty"`
 	// System 系统级网卡累计 RX/TX,跟 HTTP path 的 RemoteTrafficRequest.System 同构。
 	// 用于 server.traffic_source='system' 时累加 system_*_cycle;nil = 老 agent 不上报,跳过。
 	System *RemoteSystemTraffic `json:"system,omitempty"`
@@ -144,7 +147,8 @@ type ProbeSysWire struct {
 }
 
 // connCountsByServer 存各 server 最近一次上报的 group→当前并发连接数(内存、非持久)。用户视图"当前连接数"用。
-var connCountsByServer sync.Map // serverID(int64) -> map[string]int64
+var connCountsByServer sync.Map     // serverID(int64) -> map[string]int64
+var nodeConnCountsByServer sync.Map // serverID(int64) -> map[string]int64
 
 // AggregateUserConnCounts 把所有 server 的 group 连接数按 username 聚合(group="<user>|<nodeID>" 取 user 段求和)。
 func AggregateUserConnCounts() map[string]int64 {
@@ -159,6 +163,33 @@ func AggregateUserConnCounts() map[string]int64 {
 		return true
 	})
 	return out
+}
+
+// AggregateNodeConnCounts 返回每个节点的总连接数及节点内逐用户连接数。
+func AggregateNodeConnCounts() (map[int64]int64, map[int64]map[string]int64) {
+	totals := make(map[int64]int64)
+	users := make(map[int64]map[string]int64)
+	nodeConnCountsByServer.Range(func(_, v interface{}) bool {
+		m, _ := v.(map[string]int64)
+		for group, n := range m {
+			i := strings.LastIndex(group, "|")
+			if i <= 0 || n <= 0 {
+				continue
+			}
+			nodeID, err := strconv.ParseInt(group[i+1:], 10, 64)
+			if err != nil || nodeID <= 0 {
+				continue
+			}
+			username := group[:i]
+			totals[nodeID] += n
+			if users[nodeID] == nil {
+				users[nodeID] = make(map[string]int64)
+			}
+			users[nodeID][username] += n
+		}
+		return true
+	})
+	return totals, users
 }
 
 // WSLimiterConfigPayload 表示限速配置下发消息 (Master -> Agent)
@@ -180,6 +211,8 @@ type WSUserLimitInfo struct {
 	// ConnGroup 连接数计数分组键 = "<username>|<物理父节点ID>"。一个用户在同一物理节点(含其路由
 	// 出站子账户)的多个 email 共享同一 group → 共享一份连接配额(问题1:20 而非 20×N)。空=老 agent 兼容,退化按 email。
 	ConnGroup string `json:"conn_group,omitempty"`
+	// ConnStatGroup 始终使用实际节点 ID；路由节点不会并入物理父节点。
+	ConnStatGroup string `json:"conn_stat_group,omitempty"`
 }
 
 // WSHeartbeatPayload 表示心跳消息负载
@@ -874,6 +907,8 @@ func (h *RemoteWSHandler) handleConnection(conn *websocket.Conn, remoteAddr stri
 		log.Printf("[Remote WS] Connection closed for server %s (%d)", wsConn.ServerName, wsConn.ServerID)
 		if cur, ok := h.conns.Load(wsConn.Token); ok && cur == wsConn {
 			h.conns.Delete(wsConn.Token)
+			connCountsByServer.Delete(wsConn.ServerID)
+			nodeConnCountsByServer.Delete(wsConn.ServerID)
 			// 没有新连接接管 → 真的下线了,立即标 offline + 发通知(否则要等 traffic collector 下一轮 60s+ 检测)
 			// MarkOffline 用带超时的 ctx;通知发送用 context.Background() —— SendServer* 内部异步 go routine 发 telegram,
 			// 函数返回后 ctx 取消会把 telegram HTTP 请求一起 abort,通知发不出去。
@@ -1339,6 +1374,7 @@ func (h *RemoteWSHandler) handleTraffic(wsConn *RemoteWSConnection, payload json
 
 	// 存最近一次 group 并发连接数(nil = 该 server 当前无连接,覆盖清零)。
 	connCountsByServer.Store(wsConn.ServerID, trafficPayload.ConnCounts)
+	nodeConnCountsByServer.Store(wsConn.ServerID, trafficPayload.NodeConnCounts)
 
 	// 系统级网卡累计 — 同 HTTP path 的 RemoteTrafficHandler 处理。WS path 之前漏了这段,
 	// 导致 source=system 的 server 在 WS 连接模式下 system_*_cycle 永远不动 → traffic_used 静止。

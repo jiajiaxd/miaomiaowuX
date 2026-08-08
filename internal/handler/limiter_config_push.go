@@ -235,8 +235,9 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			Email:      user.Username + "__" + c.InboundTag,
 			SpeedLimit: speedBytes,
 			// 物理节点自身即 group 的物理节点(ref.NodeID);其路由出站子账户在下面用 ParentID 归到同一 group。
-			DeviceLimit: deviceLimit,
-			ConnGroup:   connGroupKey(user.Username, ref.NodeID),
+			DeviceLimit:   deviceLimit,
+			ConnGroup:     connGroupKey(user.Username, ref.NodeID),
+			ConnStatGroup: connGroupKey(user.Username, ref.NodeID),
 		})
 		if user.PackageID > 0 {
 			if tagPkgIDs[c.InboundTag] == nil {
@@ -272,10 +273,11 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 			physID = ref.NodeID // 兜底:父未知时按自身,避免 group="user|0" 把不同节点误并
 		}
 		tagUsers[sa.InboundTag] = append(tagUsers[sa.InboundTag], WSUserLimitInfo{
-			Email:       sa.Email,
-			SpeedLimit:  speedBytes,
-			DeviceLimit: deviceLimit,
-			ConnGroup:   connGroupKey(user.Username, physID),
+			Email:         sa.Email,
+			SpeedLimit:    speedBytes,
+			DeviceLimit:   deviceLimit,
+			ConnGroup:     connGroupKey(user.Username, physID),
+			ConnStatGroup: connGroupKey(user.Username, ref.NodeID),
 		})
 		if user.PackageID > 0 {
 			if tagPkgIDs[sa.InboundTag] == nil {
@@ -374,7 +376,7 @@ func (p *LimiterConfigPusher) RevokeAllEmbeddedServers(ctx context.Context) {
 			users := make([]WSUserLimitInfo, len(c.Users))
 			for i, u := range c.Users {
 				// 保留 Email/ConnGroup(agent 按它们索引),只清限速与连接数上限
-				users[i] = WSUserLimitInfo{Email: u.Email, ConnGroup: u.ConnGroup, SpeedLimit: 0, DeviceLimit: 0}
+				users[i] = WSUserLimitInfo{Email: u.Email, ConnGroup: u.ConnGroup, ConnStatGroup: u.ConnStatGroup, SpeedLimit: 0, DeviceLimit: 0}
 			}
 			zeroed = append(zeroed, WSLimiterConfigPayload{
 				InboundTag: c.InboundTag,
