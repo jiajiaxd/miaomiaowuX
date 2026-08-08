@@ -2926,6 +2926,11 @@ func (h *nodesHandler) handleParseURIs(w http.ResponseWriter, r *http.Request) {
 //
 //	②裸 `- name:` 列表(无 proxies: 头) ③单条 {name:...} ④proxyparser 兜底(URI/Surge INI)。
 func parsePastedProxies(content string) []map[string]any {
+	// proxyparser v0.1.7 的 SOCKS 分支会忽略端口转换错误并返回 port:0，且 scheme
+	// 区分大小写。先走本地严格兼容解析，避免坏节点进入数据库。
+	if proxies, ok := parseCompatibleURIList(content); ok {
+		return proxies
+	}
 	// ① preprocess 会把 base64 / URI 列表转成 proxies-YAML,整份 Clash 配置原样透传。
 	body := []byte(content)
 	if pre, perr := preprocessSubscriptionContent(body); perr == nil && len(pre) > 0 {

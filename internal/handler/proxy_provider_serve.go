@@ -157,6 +157,14 @@ func fetchSubscriptionContent(sub *storage.ExternalSubscription) ([]byte, error)
 // URI 解析与内容类型检测统一委托给共享 module proxyparser。
 // YAML 的实际解析仍由本地完成（module 不依赖 yaml）。
 func preprocessSubscriptionContent(content []byte) ([]byte, error) {
+	if proxies, ok := parseCompatibleURIList(string(content)); ok {
+		logger.Info("[预处理] 检测到 URI 列表，经严格兼容解析", "count", len(proxies))
+		out, mErr := yaml.Marshal(map[string]any{"proxies": proxies})
+		if mErr != nil {
+			return nil, fmt.Errorf("URI 列表转 YAML 失败: %w", mErr)
+		}
+		return out, nil
+	}
 	proxies, kind, decoded, err := proxyparser.Preprocess(content)
 	if err != nil {
 		return nil, err
