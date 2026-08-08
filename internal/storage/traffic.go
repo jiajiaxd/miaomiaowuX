@@ -5251,14 +5251,36 @@ func (r *TrafficRepository) CreateUser(ctx context.Context, username, email, nic
 		role = RoleUser
 	}
 
-	_, err := r.db.ExecContext(ctx, `INSERT INTO users (username, password_hash, email, nickname, role, is_active, remark) VALUES (?, ?, ?, ?, ?, 1, ?)`, username, passwordHash, email, nickname, role, remark)
+	// Older versions did not remove username-keyed traffic rows when an account
+	// was deleted. Recreating the same username would therefore inherit the old
+	// account's live counters and Today/Week/Month ledger. Check existence first
+	// (so a duplicate create cannot erase a real user's data), then purge only
+	// orphaned history and create the new identity in one transaction.
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin create user: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(1) FROM users WHERE username = ?`, username).Scan(&exists); err != nil {
+		return fmt.Errorf("check existing user: %w", err)
+	}
+	if exists > 0 {
+		return ErrUserExists
+	}
+	if err := purgeUserTrafficHistoryTx(ctx, tx, username); err != nil {
+		return fmt.Errorf("clear orphaned traffic before create user: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO users (username, password_hash, email, nickname, role, is_active, remark) VALUES (?, ?, ?, ?, ?, 1, ?)`, username, passwordHash, email, nickname, role, remark)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return ErrUserExists
 		}
 		return fmt.Errorf("create user: %w", err)
 	}
-
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit create user: %w", err)
+	}
 	return nil
 }
 
@@ -5598,6 +5620,13 @@ func (r *TrafficRepository) DeleteUser(ctx context.Context, username string) err
 		return fmt.Errorf("delete user token: %w", err)
 	}
 
+	// These tables are keyed by username/email rather than users.id and do not
+	// cascade. Leaving them behind makes a later account with the same username
+	// inherit both package usage and calendar-period traffic.
+	if err := purgeUserTrafficHistoryTx(ctx, tx, username); err != nil {
+		return fmt.Errorf("delete user traffic history: %w", err)
+	}
+
 	// 最后删除用户
 	res, err := tx.ExecContext(ctx, `DELETE FROM users WHERE username = ?`, username)
 	if err != nil {
@@ -5616,6 +5645,34 @@ func (r *TrafficRepository) DeleteUser(ctx context.Context, username string) err
 		return fmt.Errorf("commit transaction: %w", err)
 	}
 
+	return nil
+}
+
+// purgeUserTrafficHistoryTx removes traffic owned by one account identity.
+// Callers must first ensure that deleting this username is intended: CreateUser
+// checks that no live user exists, while DeleteUser is deleting that live user.
+func purgeUserTrafficHistoryTx(ctx context.Context, tx *dialectTx, username string) error {
+	// Snapshot rows have no attributed_username column, so remove snapshots for
+	// the exact email rows before deleting user_email_traffic itself.
+	statements := []string{
+		`DELETE FROM user_email_traffic_snapshots WHERE EXISTS (
+			SELECT 1 FROM user_email_traffic uet
+			WHERE uet.server_id = user_email_traffic_snapshots.server_id
+			  AND uet.email = user_email_traffic_snapshots.email
+			  AND uet.attributed_username = ?
+		)`,
+		`DELETE FROM user_traffic_snapshots WHERE username = ?`,
+		`DELETE FROM traffic_daily_user_nodes WHERE username = ?`,
+		`DELETE FROM traffic_daily_user_emails WHERE attributed_username = ?`,
+		`DELETE FROM traffic_daily_users WHERE username = ?`,
+		`DELETE FROM user_email_traffic WHERE attributed_username = ?`,
+		`DELETE FROM user_traffic WHERE username = ?`,
+	}
+	for _, stmt := range statements {
+		if _, err := tx.ExecContext(ctx, stmt, username); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

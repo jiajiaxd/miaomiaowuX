@@ -197,3 +197,46 @@ func TestNewMonthlyPackagePeriodDoesNotPrecedePackageStart(t *testing.T) {
 		t.Fatalf("period starts before package assignment: got %v, package start %v", periodStart, start)
 	}
 }
+
+func TestRecreatedUserDoesNotInheritDeletedUsersTraffic(t *testing.T) {
+	repo, err := NewTrafficRepository(filepath.Join(t.TempDir(), "recreated-user.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+	const username = "reused-name"
+	if err := repo.CreateUser(ctx, username, "", "", "hash", RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpsertUserEmailTraffic(ctx, 1, username+"__vless", 0, 0, false, 1, username); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpsertUserEmailTraffic(ctx, 1, username+"__vless", 100, 200, false, 1, username); err != nil {
+		t.Fatal(err)
+	}
+	today := trafficLedgerDate(time.Now())
+	// Seed the historical calendar tables explicitly; they used to survive
+	// DeleteUser because none of them has a users(username) foreign key.
+	if _, err := repo.db.ExecContext(ctx, `INSERT INTO traffic_daily_users(server_id,username,date,uplink,downlink) VALUES(1,?,?,?,?)`, username, today, 100, 200); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.DeleteUser(ctx, username); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateUser(ctx, username, "", "", "new-hash", RoleUser, ""); err != nil {
+		t.Fatal(err)
+	}
+	if used, err := repo.GetUserBillableTraffic(ctx, username); err != nil || used != 0 {
+		t.Fatalf("recreated user inherited billable traffic: used=%d err=%v", used, err)
+	}
+	rows, _, _, err := repo.ListDailyUserTraffic(ctx, "today", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.Username == username {
+			t.Fatalf("recreated user inherited calendar traffic: %+v", row)
+		}
+	}
+}
