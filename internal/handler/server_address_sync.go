@@ -58,6 +58,25 @@ func (h *RemoteManageHandler) SyncServerAddressChange(ctx context.Context, befor
 
 func serverAddressReplacements(before, after *storage.RemoteServer) map[string]string {
 	replacements := make(map[string]string)
+	// 开启“锁定节点入口 IP”时是一次显式的地址策略切换，不只是普通 IP 漂移。
+	// 已下发到其它 Agent 的出站可能仍指向旧域名、DDNS、IPv4 或 IPv6；它们都必须
+	// 收敛到用户指定的 PullAddress（chooseClashServerHost 的锁定结果）。TLS 的 SNI
+	// 位于 streamSettings，不经过 rewriteOutboundAddress，因此不会被这里误改。
+	if after.LockEntryIP {
+		locked := strings.TrimSpace(chooseClashServerHost(after))
+		if locked != "" {
+			for _, oldAddr := range []string{
+				before.IPAddress, before.IPAddressV6, before.Domain, before.DomainV6,
+				before.PullAddress, before.PullAddressV6,
+			} {
+				oldAddr = strings.TrimSpace(oldAddr)
+				if oldAddr != "" && oldAddr != locked {
+					replacements[oldAddr] = locked
+				}
+			}
+			return replacements
+		}
+	}
 	add := func(oldAddr, newAddr string) {
 		oldAddr, newAddr = strings.TrimSpace(oldAddr), strings.TrimSpace(newAddr)
 		// Only replace known literal IPs. Domains, SNI and user-provided hosts are preserved.

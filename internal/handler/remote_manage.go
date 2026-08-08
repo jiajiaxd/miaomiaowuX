@@ -1536,6 +1536,16 @@ func withoutWSRPC(ctx context.Context) context.Context {
 }
 
 func (h *RemoteManageHandler) forwardToRemoteServer(ctx context.Context, serverID int64, method, path string, body []byte) (respBody []byte, err error) {
+	// “整个节点作为出站”有多条入口（管理员路由、普通用户路由、出站管理）。
+	// 前端提交的是节点当时的 Clash 地址；服务器锁定入口 IP 后，旧页面或历史配置仍可能
+	// 携带心跳 IP/域名。所有下发路径在这里统一按节点归属服务器纠正，保证跨服务器出站
+	// 也使用用户指定的锁定 IP。
+	if method == http.MethodPost && path == "/api/child/outbounds" && len(body) > 0 {
+		if rewritten, changed := h.rewriteLockedNodeOutbound(ctx, body); changed {
+			body = rewritten
+		}
+	}
+
 	// 写操作成功 + path 命中 xray 配置修改清单 → 异步 refresh snapshot
 	// (用 defer + named return 统一处理所有 return 分支,无需在每个 return 点重复)
 	defer func() {
