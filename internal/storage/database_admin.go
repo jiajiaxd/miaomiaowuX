@@ -324,7 +324,7 @@ func verifyMigratedServerTrafficState(ctx context.Context, source *sql.Tx, targe
 			targetRows.Close()
 			return fmt.Errorf("server %d last reset unexpectedly set", id)
 		}
-		if expected != nil && (!actual.Valid || !actual.Time.UTC().Equal(*expected)) {
+		if expected != nil && (!actual.Valid || !migrationTimestampsEqual(actual.Time, *expected)) {
 			targetRows.Close()
 			return fmt.Errorf("server %d last reset differs: sqlite=%v postgres=%v", id, expected, actual)
 		}
@@ -333,6 +333,15 @@ func verifyMigratedServerTrafficState(ctx context.Context, source *sql.Tx, targe
 		return err
 	}
 	return nil
+}
+
+// PostgreSQL timestamps have microsecond precision while SQLite may preserve
+// Go's full nanosecond value in its textual representation. The copy is
+// lossless at PostgreSQL's supported precision, so verification must compare
+// the values after applying that precision instead of rejecting a sub-
+// microsecond difference.
+func migrationTimestampsEqual(left, right time.Time) bool {
+	return left.UTC().Truncate(time.Microsecond).Equal(right.UTC().Truncate(time.Microsecond))
 }
 
 // ReleaseDatabaseMigrationGate is only used when publishing the new config or

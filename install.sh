@@ -15,6 +15,9 @@ SERVICE_NAME="mmwx"
 DATA_DIR="/etc/mmwx"
 CONFIG_DIR="/etc/mmwx"
 SERVICE_MANAGER=""
+INSTALL_METHOD="${MMWX_INSTALL_METHOD:-}"
+DATABASE_MODE="${MMWX_DATABASE_DRIVER:-}"
+DOCKER_INSTALL_DIR="${MMWX_DOCKER_DIR:-/opt/miaomiaowux}"
 
 # 颜色输出
 RED='\033[0;31m'
@@ -32,6 +35,157 @@ echo_warn() {
 
 echo_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+read_choice() {
+    local prompt="$1" default="$2" value=""
+    if [ -r /dev/tty ]; then
+        read -r -p "$prompt" value </dev/tty || true
+    fi
+    echo "${value:-$default}"
+}
+
+choose_install_options() {
+    case "$INSTALL_METHOD" in local|direct|baremetal) INSTALL_METHOD="native" ;; compose) INSTALL_METHOD="docker" ;; esac
+    case "$DATABASE_MODE" in postgresql|pgsql) DATABASE_MODE="postgres" ;; esac
+    if [ -z "$INSTALL_METHOD" ]; then
+        echo "请选择安装方式:"
+        echo "  1) 本机安装（二进制 + 系统服务）"
+        echo "  2) Docker Compose 安装"
+        case "$(read_choice '请选择 (1/2，默认 1): ' 1)" in
+            2|docker) INSTALL_METHOD="docker" ;;
+            *) INSTALL_METHOD="native" ;;
+        esac
+    fi
+    if [ -z "$DATABASE_MODE" ]; then
+        echo "请选择数据库:"
+        echo "  1) SQLite（轻量，无需额外安装）"
+        echo "  2) PostgreSQL 18（推荐多服务器/高并发）"
+        case "$(read_choice '请选择 (1/2，默认 1): ' 1)" in
+            2|postgres|postgresql|pgsql) DATABASE_MODE="postgres" ;;
+            *) DATABASE_MODE="sqlite" ;;
+        esac
+    fi
+    case "$INSTALL_METHOD" in native|docker) ;; *) echo_error "不支持的安装方式: $INSTALL_METHOD"; exit 1 ;; esac
+    case "$DATABASE_MODE" in sqlite|postgres) ;; *) echo_error "不支持的数据库: $DATABASE_MODE"; exit 1 ;; esac
+    echo_info "安装方式: $INSTALL_METHOD；数据库: $DATABASE_MODE"
+}
+
+install_docker_engine() {
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        return
+    fi
+    echo_info "安装 Docker Engine 与 Compose 插件..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-v2 >/dev/null 2>&1 || \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io docker-compose-plugin >/dev/null 2>&1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y docker docker-compose-plugin >/dev/null
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y docker docker-compose-plugin >/dev/null
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache docker docker-cli-compose >/dev/null
+    else
+        echo_error "无法自动安装 Docker，请先安装 Docker Engine 和 Compose v2"
+        exit 1
+    fi
+    if command -v systemctl >/dev/null 2>&1; then systemctl enable --now docker; fi
+    if command -v rc-service >/dev/null 2>&1; then rc-update add docker default >/dev/null 2>&1 || true; rc-service docker start || true; fi
+    docker compose version >/dev/null 2>&1 || { echo_error "Docker Compose v2 安装失败"; exit 1; }
+}
+
+random_password() {
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32
+}
+
+install_docker_stack() {
+    install_docker_engine
+    mkdir -p "$DOCKER_INSTALL_DIR"/{data,subscribes,rule_templates,postgres-data}
+    curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPO}/main/docker-compose.yml" -o "$DOCKER_INSTALL_DIR/docker-compose.yml"
+    local db_password=""
+    if [ "$DATABASE_MODE" = "postgres" ]; then db_password="$(random_password)"; fi
+    cat > "$DOCKER_INSTALL_DIR/.env" <<EOF
+POSTGRES_DB=mmwx
+POSTGRES_USER=mmwx
+POSTGRES_PASSWORD=$db_password
+MMWX_DATABASE_DRIVER=$([ "$DATABASE_MODE" = "postgres" ] && echo postgres)
+MMWX_DATABASE_HOST=$([ "$DATABASE_MODE" = "postgres" ] && echo 127.0.0.1)
+MMWX_DATABASE_PORT=$([ "$DATABASE_MODE" = "postgres" ] && echo 5432)
+MMWX_DATABASE_NAME=$([ "$DATABASE_MODE" = "postgres" ] && echo mmwx)
+MMWX_DATABASE_USER=$([ "$DATABASE_MODE" = "postgres" ] && echo mmwx)
+MMWX_DATABASE_PASSWORD=$db_password
+MMWX_DATABASE_SSLMODE=$([ "$DATABASE_MODE" = "postgres" ] && echo disable)
+EOF
+    chmod 600 "$DOCKER_INSTALL_DIR/.env"
+    cd "$DOCKER_INSTALL_DIR"
+    if [ "$DATABASE_MODE" = "postgres" ]; then
+        docker compose --profile postgres up -d postgres
+        echo_info "等待 PostgreSQL 18 就绪..."
+        local ready="false"
+        for _ in $(seq 1 30); do
+            if docker exec miaomiaowux-postgres pg_isready -U mmwx -d mmwx >/dev/null 2>&1; then
+                ready="true"
+                break
+            fi
+            sleep 2
+        done
+        if [ "$ready" != "true" ]; then
+            echo_error "PostgreSQL 18 未在 60 秒内就绪，请执行 docker logs miaomiaowux-postgres 查看原因"
+            exit 1
+        fi
+        docker compose --profile postgres up -d
+    else
+        docker compose up -d
+    fi
+    echo_info "Docker Compose 部署完成"
+    echo "配置目录: $DOCKER_INSTALL_DIR"
+    echo "访问地址: http://$(primary_ip):12889"
+}
+
+install_postgresql18() {
+    if command -v psql >/dev/null 2>&1 && psql --version | grep -q ' 18\.'; then return; fi
+    echo_info "安装 PostgreSQL 18..."
+    if command -v apt-get >/dev/null 2>&1; then
+        . /etc/os-release
+        install -d -m 0755 /usr/share/postgresql-common/pgdg
+        curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+        echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-18 postgresql-client-18 >/dev/null
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        local pm="dnf"; command -v dnf >/dev/null 2>&1 || pm="yum"
+        $pm install -y "https://download.postgresql.org/pub/repos/yum/reporpms/EL-$(rpm -E '%{rhel}')-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm" >/dev/null
+        $pm -qy module disable postgresql >/dev/null 2>&1 || true
+        $pm install -y postgresql18-server postgresql18 >/dev/null
+        [ -s /var/lib/pgsql/18/data/PG_VERSION ] || /usr/pgsql-18/bin/postgresql-18-setup initdb
+        systemctl enable --now postgresql-18
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache postgresql18 postgresql18-client >/dev/null || { echo_error "当前 Alpine 仓库没有 PostgreSQL 18，请升级 Alpine 或选择 SQLite/Docker"; exit 1; }
+        [ -s /var/lib/postgresql/18/data/PG_VERSION ] || su postgres -c 'initdb -D /var/lib/postgresql/18/data'
+        rc-update add postgresql default >/dev/null 2>&1 || true
+        rc-service postgresql start
+    else
+        echo_error "当前系统暂不支持自动安装 PostgreSQL 18"
+        exit 1
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files postgresql.service >/dev/null 2>&1; then systemctl enable --now postgresql; fi
+}
+
+configure_native_postgres() {
+    install_postgresql18
+    local password="$(random_password)"
+    su postgres -c "psql -v ON_ERROR_STOP=1 --set=mmwx_password='$password'" <<'SQL'
+SELECT format('CREATE ROLE mmwx LOGIN PASSWORD %L', :'mmwx_password')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='mmwx') \gexec
+ALTER ROLE mmwx PASSWORD :'mmwx_password';
+SELECT 'CREATE DATABASE mmwx OWNER mmwx'
+WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname='mmwx') \gexec
+SQL
+    cat > "$DATA_DIR/data/database.json" <<EOF
+{"driver":"postgres","host":"127.0.0.1","port":5432,"database":"mmwx","username":"mmwx","password":"$password","ssl_mode":"disable","max_open_conns":30,"max_idle_conns":10}
+EOF
+    chmod 600 "$DATA_DIR/data/database.json"
 }
 
 # 检查是否为 root 用户
@@ -641,6 +795,12 @@ main() {
         echo ""
 
         check_root
+        choose_install_options
+        if [ "$INSTALL_METHOD" = "docker" ]; then
+            install_dependencies
+            install_docker_stack
+            return
+        fi
         check_architecture
         install_dependencies
         detect_service_manager
@@ -648,6 +808,9 @@ main() {
         download_binary
         install_binary
         create_directories
+        if [ "$DATABASE_MODE" = "postgres" ]; then
+            configure_native_postgres
+        fi
         create_systemd_service
 
         # 保存版本信息

@@ -9,6 +9,13 @@ services:
     environment:
       - PORT=12889
       - LOG_LEVEL=info
+      - MMWX_DATABASE_DRIVER=${MMWX_DATABASE_DRIVER:-}
+      - MMWX_DATABASE_HOST=${MMWX_DATABASE_HOST:-}
+      - MMWX_DATABASE_PORT=${MMWX_DATABASE_PORT:-}
+      - MMWX_DATABASE_NAME=${MMWX_DATABASE_NAME:-}
+      - MMWX_DATABASE_USER=${MMWX_DATABASE_USER:-}
+      - MMWX_DATABASE_PASSWORD=${MMWX_DATABASE_PASSWORD:-}
+      - MMWX_DATABASE_SSLMODE=${MMWX_DATABASE_SSLMODE:-}
 
     volumes:
       - ./data:/app/data
@@ -29,9 +36,10 @@ services:
   # PostgreSQL 供首次初始化或“系统设置 → 数据库”在线迁移使用。
   # 主控使用 host 网络，因此应填写 127.0.0.1:5432，而不是服务名 postgres。
   postgres:
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     container_name: miaomiaowux-postgres
     restart: unless-stopped
+    profiles: ["postgres"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-mmwx}
       POSTGRES_USER: ${POSTGRES_USER:-mmwx}
@@ -39,7 +47,8 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
-      - ./postgres-data:/var/lib/postgresql/data
+      # PostgreSQL 18+ 的官方镜像要求挂载父目录，PGDATA 位于 18/docker。
+      - ./postgres-data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s

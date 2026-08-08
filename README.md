@@ -38,7 +38,14 @@ Clash(Meta) / Surge / Loon / Quantumult X / Shadowrocket / SingBox / Stash / Sur
 curl -sL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install.sh | sudo bash
 ```
 
-自动检测架构、下载最新版本、创建 systemd 服务。安装完成后访问 `http://服务器IP:12889` 进入初始化向导。
+脚本会依次让你选择：
+
+1. **本机安装**或 **Docker Compose 安装**；
+2. **SQLite** 或 **PostgreSQL 18**。
+
+本机 + SQLite 不安装额外数据库；本机 + PostgreSQL 会安装 PostgreSQL 18、创建数据库和账号并写入 `/etc/mmwx/data/database.json`。Docker 使用 Compose 部署，选择 PostgreSQL 时会额外启动 `postgres:18-alpine` 并自动把连接信息交给主控。安装完成后访问 `http://服务器公网IP:12889`。
+
+无人值守安装可设置 `MMWX_INSTALL_METHOD=native|docker` 和 `MMWX_DATABASE_DRIVER=sqlite|postgres`。
 
 更新：
 ```bash
@@ -56,42 +63,24 @@ curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-pr
 curl -sL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install.sh | sudo bash -s uninstall
 ```
 
-### 方式 2：Docker 部署
+### 方式 2：手动 Docker Compose 部署
 
 > 默认使用 host 网络模式 — 便于 agent 反向连接、多端口场景,也避免后续新增端口又要改 compose。
 >
 > 镜像已内置 Nginx，无需 systemd。使用 host 网络后，主控可直接申请、部署证书并管理 HTTPS；请确保宿主机的 80/443 端口未被其他服务占用。
 
 ```bash
-docker run -d \
-  --name miaomiaowux \
-  --network host \
-  --restart unless-stopped \
-  -v $(pwd)/data:/app/data \
-  -v $(pwd)/subscribes:/app/subscribes \
-  -v $(pwd)/rule_templates:/app/rule_templates \
-  ghcr.io/iluobei/miaomiaowux:latest
+mkdir -p /opt/miaomiaowux && cd /opt/miaomiaowux
+curl -O https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/docker-compose.yml
+
+# SQLite：只启动主控
+docker compose up -d
+
+# PostgreSQL 18：先在 .env 设置 POSTGRES_PASSWORD 及 MMWX_DATABASE_*，再启动 profile
+docker compose --profile postgres up -d
 ```
 
-#### Docker Compose
-
-```yaml
-version: '3.8'
-
-services:
-  miaomiaowux:
-    image: ghcr.io/iluobei/miaomiaowux:latest
-    container_name: miaomiaowux
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      - PORT=12889
-      - LOG_LEVEL=info
-    volumes:
-      - ./data:/app/data
-      - ./subscribes:/app/subscribes
-      - ./rule_templates:/app/rule_templates
-```
+推荐直接使用一键脚本生成 `.env`，避免数据库密码与连接参数不一致。持久化目录为 `data/`、`subscribes/`、`rule_templates/` 与 `postgres-data/`。
 
 #### Docker 开启 HTTPS
 
@@ -161,7 +150,7 @@ connection_mode: "auto"   # auto | websocket | http | pull
 
 ## 技术栈
 
-- 后端：Go 1.25 + net/http + SQLite (modernc.org/sqlite)
+- 后端：Go + net/http + SQLite / PostgreSQL 18
 - 前端：React 19 + Vite 7 + TanStack Router + TailwindCSS 4 + shadcn/ui
 - 单二进制部署，前端通过 Go embed 嵌入
 

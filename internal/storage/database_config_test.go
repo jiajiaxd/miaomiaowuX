@@ -10,6 +10,17 @@ import (
 	"time"
 )
 
+func TestMigrationTimestampsEqualUsesPostgresPrecision(t *testing.T) {
+	sqlite := time.Date(2026, 8, 1, 0, 7, 6, 381466714, time.FixedZone("UTC", 0))
+	postgres := time.Date(2026, 8, 1, 0, 7, 6, 381466000, time.UTC)
+	if !migrationTimestampsEqual(sqlite, postgres) {
+		t.Fatalf("sub-microsecond precision loss must not fail migration: sqlite=%v postgres=%v", sqlite, postgres)
+	}
+	if migrationTimestampsEqual(sqlite, postgres.Add(time.Microsecond)) {
+		t.Fatalf("a full microsecond difference must still fail verification")
+	}
+}
+
 func TestDatabaseConfigRoundTripAndPermissions(t *testing.T) {
 	dir := t.TempDir()
 	in := DatabaseConfig{Driver: "postgresql", Host: "db", Port: 5432, Database: "mmwx", Username: "app", Password: "secret", SSLMode: "require"}
