@@ -402,6 +402,12 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 	if req.ChallengeMode == "" {
 		req.ChallengeMode = storage.CertChallengeStandalone
 	}
+	// 证书始终由主控 ACME 客户端申请。Agent 只负责接收已签发的证书；它没有
+	// cert_request/ACME 实现，允许 remote_server_id 会让记录永久停在 pending。
+	if req.RemoteServerID != 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "证书只能由主控申请，签发后可部署到远程服务器"})
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
@@ -452,23 +458,12 @@ func (h *CertificateHandler) CreateCertificate(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if req.RemoteServerID == 0 {
-		// 本地证书请求
-		go h.requestLocalCertificate(cert)
-		respondJSON(w, http.StatusAccepted, SingleCertificateResponse{
-			Success:     true,
-			Message:     "证书申请已提交，正在处理中...",
-			Certificate: &CertificateResponse{ID: cert.ID, Domain: cert.Domain, Status: storage.CertStatusPending},
-		})
-	} else {
-		// 通过WebSocket远程证书请求
-		go h.requestRemoteCertificate(cert)
-		respondJSON(w, http.StatusAccepted, SingleCertificateResponse{
-			Success:     true,
-			Message:     "证书申请已发送到远程服务器...",
-			Certificate: &CertificateResponse{ID: cert.ID, Domain: cert.Domain, Status: storage.CertStatusPending},
-		})
-	}
+	go h.requestLocalCertificate(cert)
+	respondJSON(w, http.StatusAccepted, SingleCertificateResponse{
+		Success:     true,
+		Message:     "证书申请已提交，正在处理中...",
+		Certificate: &CertificateResponse{ID: cert.ID, Domain: cert.Domain, Status: storage.CertStatusPending},
+	})
 }
 
 // 使用 ACME 在本地请求证书。
@@ -631,11 +626,8 @@ func (h *CertificateHandler) RenewCertificate(w http.ResponseWriter, r *http.Req
 	// 将状态更新为待处理
 	_ = h.repo.UpdateCertificateStatus(ctx, cert.ID, storage.CertStatusPending, "正在续期...")
 
-	if cert.RemoteServerID == 0 {
-		go h.renewLocalCertificate(cert)
-	} else {
-		go h.requestRemoteCertificate(cert)
-	}
+	// 兼容旧版本留下的 remote_server_id>0 记录：续期也统一在主控执行。
+	go h.renewLocalCertificate(cert)
 
 	respondJSON(w, http.StatusAccepted, map[string]any{"success": true, "message": "证书续期已提交"})
 }
@@ -1204,24 +1196,51 @@ func (h *CertificateHandler) deployToAllRemotesAndWait(ctx context.Context, doma
 		Reload:   reloadTarget,
 	}
 	results := make([]certificateDeployTargetResult, len(servers))
-	var wg sync.WaitGroup
+	type indexedResult struct {
+		index  int
+		result certificateDeployTargetResult
+	}
+	resultCh := make(chan indexedResult, len(servers))
 	for i := range servers {
 		i, server := i, servers[i]
-		wg.Add(1)
+		if !server.IsFederated && server.Status != storage.RemoteServerStatusConnected {
+			results[i] = certificateDeployTargetResult{Target: server.Name, Error: "服务器未连接"}
+			continue
+		}
 		go func() {
-			defer wg.Done()
 			result := certificateDeployTargetResult{Target: server.Name}
-			deployCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			deployCtx, cancel := context.WithTimeout(ctx, 18*time.Second)
 			defer cancel()
 			if err := h.deployToRemoteServerSync(deployCtx, &server, payload); err != nil {
 				result.Error = err.Error()
 			} else {
 				result.Success = true
 			}
-			results[i] = result
+			resultCh <- indexedResult{index: i, result: result}
 		}()
 	}
-	wg.Wait()
+	pending := 0
+	for i, server := range servers {
+		if server.IsFederated || server.Status == storage.RemoteServerStatusConnected {
+			pending++
+		} else if results[i].Target == "" {
+			results[i] = certificateDeployTargetResult{Target: server.Name, Error: "服务器未连接"}
+		}
+	}
+	for pending > 0 {
+		select {
+		case item := <-resultCh:
+			results[item.index] = item.result
+			pending--
+		case <-ctx.Done():
+			for i := range results {
+				if results[i].Target == "" {
+					results[i] = certificateDeployTargetResult{Target: servers[i].Name, Error: "部署等待超时"}
+				}
+			}
+			return results
+		}
+	}
 	return results
 }
 
@@ -1296,13 +1315,13 @@ func (h *CertificateHandler) DeployCertificate(w http.ResponseWriter, r *http.Re
 	// 本机 reload/systemctl 在异常环境中可能永久阻塞。限制为 20 秒；远程
 	// Agent 并发部署且逐台确认，整个请求最长约 30 秒而不是按服务器数量累加。
 	results := make([]certificateDeployTargetResult, 0, 1)
-	batchCtx, batchCancel := context.WithTimeout(r.Context(), 35*time.Second)
+	batchCtx, batchCancel := context.WithTimeout(r.Context(), 25*time.Second)
 	defer batchCancel()
 	remoteResults := make(chan []certificateDeployTargetResult, 1)
 	go func() {
 		remoteResults <- h.deployToAllRemotesAndWait(batchCtx, cert.Domain, cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget)
 	}()
-	localCtx, localCancel := context.WithTimeout(batchCtx, 20*time.Second)
+	localCtx, localCancel := context.WithTimeout(batchCtx, 12*time.Second)
 	localErr := acme.DeployContext(localCtx, cert.CertPEM, cert.KeyPEM, req.DeployCertPath, req.DeployKeyPath, req.DeployTarget)
 	localCancel()
 	localResult := certificateDeployTargetResult{Target: "主服务器", Success: localErr == nil}
@@ -1311,7 +1330,12 @@ func (h *CertificateHandler) DeployCertificate(w http.ResponseWriter, r *http.Re
 		log.Printf("[Certificate] Local deploy failed for %s: %v", cert.Domain, localErr)
 	}
 	results = append(results, localResult)
-	confirmedRemotes := <-remoteResults
+	var confirmedRemotes []certificateDeployTargetResult
+	select {
+	case confirmedRemotes = <-remoteResults:
+	case <-batchCtx.Done():
+		confirmedRemotes = []certificateDeployTargetResult{{Target: "远程服务器批量部署", Error: "部署等待超时"}}
+	}
 	results = append(results, confirmedRemotes...)
 
 	failed := make([]string, 0)
