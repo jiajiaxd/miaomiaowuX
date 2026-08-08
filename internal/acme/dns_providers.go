@@ -1,8 +1,10 @@
 package acme
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/go-acme/lego/v4/challenge"
 	"github.com/go-acme/lego/v4/providers/dns/alidns"
@@ -21,6 +23,33 @@ var DNSProviderEnvKeys = map[string][]string{
 	"dnspod":       {"DNSPOD_API_KEY"},
 	"namesilo":     {"NAMESILO_API_KEY"},
 	"godaddy":      {"GODADDY_API_KEY", "GODADDY_API_SECRET"},
+}
+
+// ValidateDNSCredentials validates the persisted JSON before it reaches lego.
+// Cloudflare supports either the recommended scoped token or the legacy
+// email/global-key pair; every other supported provider requires all listed keys.
+func ValidateDNSCredentials(providerType, raw string) error {
+	var credentials map[string]string
+	if err := json.Unmarshal([]byte(raw), &credentials); err != nil {
+		return fmt.Errorf("credentials must be a JSON object: %w", err)
+	}
+	nonEmpty := func(key string) bool { return strings.TrimSpace(credentials[key]) != "" }
+	switch providerType {
+	case "cloudflare":
+		if nonEmpty("CF_DNS_API_TOKEN") || (nonEmpty("CF_API_EMAIL") && nonEmpty("CF_API_KEY")) {
+			return nil
+		}
+		return fmt.Errorf("Cloudflare requires CF_DNS_API_TOKEN")
+	case "alidns", "tencentcloud", "dnspod", "namesilo", "godaddy":
+		for _, key := range DNSProviderEnvKeys[providerType] {
+			if !nonEmpty(key) {
+				return fmt.Errorf("missing required credential %s", key)
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported DNS provider type: %s", providerType)
+	}
 }
 
 // NewDNSProviderByName 按名称创建 DNS 质询提供程序。

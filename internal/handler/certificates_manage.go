@@ -1415,6 +1415,10 @@ func (h *CertificateHandler) CreateDNSProvider(w http.ResponseWriter, r *http.Re
 		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "名称、类型和凭证不能为空"})
 		return
 	}
+	if err := acme.ValidateDNSCredentials(req.ProviderType, req.Credentials); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": fmt.Sprintf("DNS 凭证配置错误: %v", err)})
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
@@ -1450,6 +1454,14 @@ func (h *CertificateHandler) UpdateDNSProvider(w http.ResponseWriter, r *http.Re
 	var req DNSProviderRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "无效的请求数据"})
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": "名称不能为空"})
+		return
+	}
+	if err := acme.ValidateDNSCredentials(req.ProviderType, req.Credentials); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]any{"success": false, "message": fmt.Sprintf("DNS 凭证配置错误: %v", err)})
 		return
 	}
 
