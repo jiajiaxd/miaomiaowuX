@@ -222,6 +222,16 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.4.7-beta.5 (2026-08-10)
+- 🛠️ fix: openrc 重启失败
+- 🌈 支持各种问题引起的xray凭据错误修复
+- 🛠️ fix: 修改自定义连接后无效
+- 🌈 探针自定义主题名称
+- 🛠️ fix: tg通知[转义
+- 🌈 uri支持服务器筛选
+- 🛠️ fix: 增加探针数据
+- 🛠️ fix: 节点更新导致的子用户重置
+- 🌈 探针API参数说明
 ### v0.4.7-beta.4 (2026-08-09)
 - 🌈 偷自己的禁止开启reality防偷
 ### v0.4.7-beta.3 (2026-08-09)
