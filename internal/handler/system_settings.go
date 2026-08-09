@@ -329,7 +329,7 @@ const (
 	probeInternalEnabledKey = "probe_internal_enabled" // 内置探针独立开关
 	probeExternalEnabledKey = "probe_external_enabled" // 外置探针独立开关
 	probeDisguiseTitleKey   = "probe_disguise_title"   // 伪装页标题(管理员自定义)
-	probeDisguiseThemeKey   = "probe_disguise_theme"   // follow/flat/pixel/anime
+	probeDisguiseThemeKey   = "probe_disguise_theme"   // follow/flat/pixel/anime 或外置探针自定义主题名
 	// 伪装页 logo:图片 URL 或 data: URI。空=只显示标题。
 	// data: URI 有大小上限(probeLogoMaxBytes)——公开端点每 5 秒轮询一次,大图会持续吃带宽。
 	probeDisguiseLogoKey = "probe_disguise_logo"
@@ -364,6 +364,24 @@ const (
 	probeExternalTokenHashKey = "probe_external_token_sha256"
 )
 
+// validProbeThemeName keeps the value safe for the external probe's
+// `theme-<name>` CSS class while allowing deployments to provide their own
+// theme names. Empty values are handled by the caller as "follow".
+func validProbeThemeName(theme string) bool {
+	if len(theme) == 0 || len(theme) > 64 {
+		return false
+	}
+	for i := 0; i < len(theme); i++ {
+		c := theme[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // GetProbeDisguise 返回伪装探针配置(管理端)。
 func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -380,7 +398,7 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	}
 	title, _ := h.repo.GetSystemSetting(ctx, probeDisguiseTitleKey)
 	theme, _ := h.repo.GetSystemSetting(ctx, probeDisguiseThemeKey)
-	if theme != "flat" && theme != "pixel" && theme != "anime" {
+	if !validProbeThemeName(theme) {
 		theme = "follow"
 	}
 	logo, _ := h.repo.GetSystemSetting(ctx, probeDisguiseLogoKey)
@@ -597,10 +615,10 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		if theme == "" {
 			theme = "follow"
 		}
-		if theme != "follow" && theme != "flat" && theme != "pixel" && theme != "anime" {
+		if !validProbeThemeName(theme) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "不支持的探针主题"})
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "主题名称只能包含字母、数字、下划线和连字符，且长度不能超过 64"})
 			return
 		}
 		if h.repo.SetSystemSetting(ctx, probeDisguiseThemeKey, theme) != nil {

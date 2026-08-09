@@ -160,7 +160,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	if theme == "" || theme == "follow" {
 		theme, _ = h.repo.GetSystemSetting(ctx, DefaultThemeKey)
 	}
-	if theme != "flat" && theme != "anime" && theme != "pixel" {
+	if !validProbeThemeName(theme) || theme == "follow" {
 		theme = "pixel"
 	}
 	// 未登录访客要据此决定 /login 是否放行,所以必须走公开端点
