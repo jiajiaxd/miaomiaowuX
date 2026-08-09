@@ -151,7 +151,10 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 
 	title, _ := h.repo.GetSystemSetting(ctx, probeDisguiseTitleKey)
 	logo, _ := h.repo.GetSystemSetting(ctx, probeDisguiseLogoKey)
-	theme, _ := h.repo.GetSystemSetting(ctx, DefaultThemeKey)
+	theme, _ := h.repo.GetSystemSetting(ctx, probeDisguiseThemeKey)
+	if theme == "" || theme == "follow" {
+		theme, _ = h.repo.GetSystemSetting(ctx, DefaultThemeKey)
+	}
 	if theme != "flat" && theme != "anime" && theme != "pixel" {
 		theme = "pixel"
 	}

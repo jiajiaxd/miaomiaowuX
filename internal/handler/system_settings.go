@@ -329,6 +329,7 @@ const (
 	probeInternalEnabledKey = "probe_internal_enabled" // 内置探针独立开关
 	probeExternalEnabledKey = "probe_external_enabled" // 外置探针独立开关
 	probeDisguiseTitleKey   = "probe_disguise_title"   // 伪装页标题(管理员自定义)
+	probeDisguiseThemeKey   = "probe_disguise_theme"   // follow/flat/pixel/anime
 	// 伪装页 logo:图片 URL 或 data: URI。空=只显示标题。
 	// data: URI 有大小上限(probeLogoMaxBytes)——公开端点每 5 秒轮询一次,大图会持续吃带宽。
 	probeDisguiseLogoKey = "probe_disguise_logo"
@@ -378,6 +379,10 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 		internalEnabled, externalEnabled = "1", "1"
 	}
 	title, _ := h.repo.GetSystemSetting(ctx, probeDisguiseTitleKey)
+	theme, _ := h.repo.GetSystemSetting(ctx, probeDisguiseThemeKey)
+	if theme != "flat" && theme != "pixel" && theme != "anime" {
+		theme = "follow"
+	}
 	logo, _ := h.repo.GetSystemSetting(ctx, probeDisguiseLogoKey)
 	blockLogin, _ := h.repo.GetSystemSetting(ctx, probeDisguiseBlockLoginKey)
 	showName, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowNameKey)
@@ -427,6 +432,7 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 		"internal_enabled":          internalEnabled == "1",
 		"external_enabled":          externalEnabled == "1",
 		"title":                     title,
+		"theme":                     theme,
 		"logo":                      logo,
 		"block_login":               blockLogin == "1",
 		"server_ids":                ids,
@@ -457,10 +463,11 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		return
 	}
 	var req struct {
-		Enabled         bool   `json:"enabled"`
-		InternalEnabled *bool  `json:"internal_enabled"`
-		ExternalEnabled *bool  `json:"external_enabled"`
-		Title           string `json:"title"`
+		Enabled         bool    `json:"enabled"`
+		InternalEnabled *bool   `json:"internal_enabled"`
+		ExternalEnabled *bool   `json:"external_enabled"`
+		Title           string  `json:"title"`
+		Theme           *string `json:"theme"`
 		// 指针语义:nil=不改(旧前端 PUT 不带这个字段时不会被冲成空)。
 		Logo       *string `json:"logo"`
 		BlockLogin *bool   `json:"block_login"`
@@ -581,6 +588,22 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 			return
 		}
 		if h.repo.SetSystemSetting(ctx, probeDisguiseLogoKey, logo) != nil {
+			fail()
+			return
+		}
+	}
+	if req.Theme != nil {
+		theme := strings.TrimSpace(*req.Theme)
+		if theme == "" {
+			theme = "follow"
+		}
+		if theme != "follow" && theme != "flat" && theme != "pixel" && theme != "anime" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "不支持的探针主题"})
+			return
+		}
+		if h.repo.SetSystemSetting(ctx, probeDisguiseThemeKey, theme) != nil {
 			fail()
 			return
 		}
