@@ -29,6 +29,7 @@ func NewPackageSubscribeHandler(repo *storage.TrafficRepository) http.Handler {
 }
 
 func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	setSubscriptionNoCacheHeaders(w)
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("only GET is supported"))
 		return

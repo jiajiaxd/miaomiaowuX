@@ -38,6 +38,10 @@ func (h *shortLinkHandler) TryServe(w http.ResponseWriter, r *http.Request) bool
 	if r.Method != http.MethodGet {
 		return false
 	}
+	// 订阅短码是可轮换凭据，任何中间缓存都会让已经更换或删除的旧地址
+	// 在数据库不再命中的情况下继续返回历史订阅。显式禁止浏览器、反代和
+	// CDN 缓存；内容缓存由订阅生成器内部负责，不能缓存鉴权入口响应。
+	setSubscriptionNoCacheHeaders(w)
 
 	code := strings.Trim(r.URL.Path, "/")
 	code = strings.TrimPrefix(code, "x/")

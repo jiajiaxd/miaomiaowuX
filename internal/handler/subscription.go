@@ -150,7 +150,16 @@ func newSubscriptionHandler(repo *storage.TrafficRepository, baseDir, fallback s
 	return &SubscriptionHandler{repo: repo, baseDir: cleanedBase, fallback: fallback}
 }
 
+func setSubscriptionNoCacheHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "private, no-store, no-cache, must-revalidate, max-age=0")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+}
+
 func (s *subscriptionEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// token 与短码都允许用户主动轮换，入口响应不能被 CDN/反代缓存，否则
+	// 已失效的旧 URL 仍可能在源站重启后继续返回历史内容。
+	setSubscriptionNoCacheHeaders(w)
 	request, ok := s.authorizeRequest(w, r)
 	if !ok {
 		return
