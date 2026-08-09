@@ -31,9 +31,9 @@ type Service struct {
 	themeVal string
 	themeExp time.Time
 
-	// Mini App 左上角标题跟随主控自定义品牌标题，缓存策略同主题。
+	// Mini App 左上角标题和 Logo 跟随主控自定义品牌，缓存策略同主题。
 	brandMu  sync.Mutex
-	brandVal string
+	brandVal mmwxclient.Branding
 	brandExp time.Time
 }
 

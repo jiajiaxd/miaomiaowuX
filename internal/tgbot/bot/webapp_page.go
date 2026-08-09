@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"miaomiaowux/internal/tgbot/mmwxclient"
 )
 
 // webAppPage 返回 Mini App 单页(自包含,引 Telegram WebApp SDK)。
@@ -26,16 +28,23 @@ func (s *Service) webAppPage(w http.ResponseWriter, r *http.Request) {
 	}
 	html := strings.ReplaceAll(webAppHTML, "__DEVPREVIEW__", flag)
 	html = strings.ReplaceAll(html, "__THEME__", themeClass)
-	brandTitle := s.cachedBrandTitle(r.Context())
+	branding := s.cachedBranding(r.Context())
+	brandTitle := branding.BrandTitle
 	brandHTML := `妙妙屋<span class="ax"><span class="ax-t">X</span><span class="ax-g" aria-hidden="true">X</span><span class="ax-p" aria-hidden="true"></span></span>`
 	if brandTitle != "" {
 		brandHTML = stdhtml.EscapeString(brandTitle)
 	}
 	html = strings.ReplaceAll(html, "__BRAND_TITLE__", brandHTML)
+	logoURL := branding.LogoURL
+	if logoURL == "" {
+		logoURL = "/api/tg-webapp/logo-light"
+	}
+	html = strings.ReplaceAll(html, "__BRAND_LOGO__", stdhtml.EscapeString(logoURL))
+	html = strings.ReplaceAll(html, "__CUSTOM_BRAND_LOGO__", stdhtml.EscapeString(branding.LogoURL))
 	_, _ = w.Write([]byte(html))
 }
 
-func (s *Service) cachedBrandTitle(ctx context.Context) string {
+func (s *Service) cachedBranding(ctx context.Context) mmwxclient.Branding {
 	s.brandMu.Lock()
 	if time.Now().Before(s.brandExp) {
 		v := s.brandVal
@@ -46,7 +55,7 @@ func (s *Service) cachedBrandTitle(ctx context.Context) string {
 
 	cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	v, err := s.client.GetBrandTitle(cctx)
+	v, err := s.client.GetBranding(cctx)
 	if err != nil {
 		s.brandMu.Lock()
 		defer s.brandMu.Unlock()
@@ -181,7 +190,7 @@ nav svg{width:22px;height:22px}
 </head>
 <body>
 <header>
-  <img id="logo" class="logo" src="/api/tg-webapp/logo-light" alt="妙妙屋X">
+  <img id="logo" class="logo" src="__BRAND_LOGO__" data-custom="__CUSTOM_BRAND_LOGO__" alt="妙妙屋X">
   <span class="brand">__BRAND_TITLE__</span>
   <span class="sub">我的面板</span>
 </header>
@@ -232,7 +241,7 @@ function hap(kind,style){try{if(tg&&tg.HapticFeedback&&tg.isVersionAtLeast&&tg.i
 function copyText(u){try{if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(u);return;}}catch(e){}try{var ta=document.createElement("textarea");ta.value=u;ta.style.position="fixed";ta.style.opacity="0";document.body.appendChild(ta);ta.select();document.execCommand("copy");document.body.removeChild(ta);}catch(e){}}
 function setScheme(){var dark=tg?(tg.colorScheme==="dark"):window.matchMedia&&window.matchMedia("(prefers-color-scheme:dark)").matches;
  document.documentElement.classList.toggle("dark",!!dark);
- var lg=document.getElementById("logo");if(lg)lg.src=dark?"/api/tg-webapp/logo-dark":"/api/tg-webapp/logo-light";}
+ var lg=document.getElementById("logo");if(lg&&!lg.getAttribute("data-custom"))lg.src=dark?"/api/tg-webapp/logo-dark":"/api/tg-webapp/logo-light";}
 function copy(u){hap("impact","light");copyText(u);toast("已复制订阅链接");}
 window.__copy=copy;
 // 客户端选择(value=主控订阅 ?t= 参数,口径同妙妙屋X 前端)

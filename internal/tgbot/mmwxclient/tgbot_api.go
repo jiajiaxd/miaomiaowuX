@@ -611,16 +611,21 @@ func (c *Client) GetDefaultTheme(ctx context.Context) (string, error) {
 	return out.DefaultTheme, nil
 }
 
-// GetBrandTitle 取主控当前生效的左上角品牌标题。公开 branding 接口已经处理 PRO 门控；
-// 未配置或功能未生效时返回空，由 Mini App 使用内置标题。
-func (c *Client) GetBrandTitle(ctx context.Context) (string, error) {
+// Branding 仅包含 Mini App 需要的公开品牌字段。公开 branding 接口已经处理 PRO 门控。
+type Branding struct {
+	BrandTitle string `json:"brand_title"`
+	LogoURL    string `json:"logo_url"`
+}
+
+// GetBranding 取主控当前生效的品牌；未配置或功能未生效时字段为空，由 Mini App 使用内置资源。
+func (c *Client) GetBranding(ctx context.Context) (Branding, error) {
 	var out struct {
-		Branding struct {
-			BrandTitle string `json:"brand_title"`
-		} `json:"branding"`
+		Branding Branding `json:"branding"`
 	}
 	if err := c.get(ctx, "/api/branding", nil, &out); err != nil {
-		return "", err
+		return Branding{}, err
 	}
-	return strings.TrimSpace(out.Branding.BrandTitle), nil
+	out.Branding.BrandTitle = strings.TrimSpace(out.Branding.BrandTitle)
+	out.Branding.LogoURL = strings.TrimSpace(out.Branding.LogoURL)
+	return out.Branding, nil
 }
