@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"regexp"
@@ -235,7 +236,27 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 			return
 		}
 
+		// 先准备并提交所有服务器的完整目标配置，全部成功后才切换用户状态。
+		// 启用账号不等于绕过套餐状态：超限或套餐过期时只恢复面板登录。
+		shouldSyncAccess := !payload.IsActive
+		if payload.IsActive {
+			overLimit, _ := repo.IsUserOverLimit(ctx, username)
+			packageValid := targetUser.PackageID > 0 &&
+				(targetUser.PackageEndDate == nil || targetUser.PackageEndDate.After(time.Now()))
+			shouldSyncAccess = !overLimit && packageValid
+		}
+		if shouldSyncAccess && remoteManage != nil {
+			if err := syncUserAccessTransactionally(ctx, repo, remoteManage, targetUser, payload.IsActive, false); err != nil {
+				writeError(w, http.StatusBadGateway, fmt.Errorf("用户状态未修改，Xray 配置事务失败: %w", err))
+				return
+			}
+		}
+
 		if err := repo.UpdateUserStatus(ctx, username, payload.IsActive); err != nil {
+			// 数据库提交失败时，把刚切换的 Agent 配置补偿回原状态。
+			if shouldSyncAccess && remoteManage != nil {
+				_ = syncUserAccessTransactionally(context.WithoutCancel(ctx), repo, remoteManage, targetUser, !payload.IsActive, false)
+			}
 			if errors.Is(err, storage.ErrUserNotFound) {
 				writeError(w, http.StatusNotFound, errors.New("user not found"))
 				return
@@ -256,53 +277,8 @@ func NewUserStatusHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 			}
 		}
 
-		// 状态切换后,同步 xray inbound clients。
-		// 仅在 remoteManage 非空且用户有套餐绑定时才有 inbound 需要操作。
-		if remoteManage != nil {
-			accessSync := NewTrafficLimitEnforcer(repo, remoteManage, pusher)
-			configs, cfgErr := repo.GetUserInboundConfigs(ctx, username)
-			if cfgErr != nil {
-				log.Printf("[UserStatus] get inbound configs for %s failed: %v", username, cfgErr)
-			}
-			if !payload.IsActive {
-				plainOK := cfgErr == nil
-				// 禁用 → 从每个 inbound 移除 client (但保留 user_inbound_configs 行)
-				for _, cfg := range configs {
-					if err := removeUserFromInbound(ctx, remoteManage, cfg); err != nil {
-						log.Printf("[UserStatus] disable: remove %s from inbound %s on server %d failed: %v",
-							username, cfg.InboundTag, cfg.ServerID, err)
-						plainOK = false
-					}
-				}
-				// 同时摘除 shared + user 两类 routed 子账户。失败时保留 enforced=0，
-				// TrafficLimitEnforcer 会在后续周期继续重试。
-				routedOK := accessSync.suspendUserRoutedAccess(ctx, username)
-				if plainOK && routedOK {
-					_ = repo.UpdateUserDisabledAccessEnforced(ctx, username, true)
-				}
-			} else {
-				// 启用账号不等于绕过套餐状态：仍超流量或套餐已过期时只恢复登录，
-				// 不得把 Xray 凭据重新加回。
-				overLimit, _ := repo.IsUserOverLimit(ctx, username)
-				packageValid := targetUser.PackageID > 0 &&
-					(targetUser.PackageEndDate == nil || targetUser.PackageEndDate.After(time.Now()))
-				if overLimit || !packageValid {
-					log.Printf("[UserStatus] enable %s without restoring access (over_limit=%t package_valid=%t)",
-						username, overLimit, packageValid)
-				} else {
-					// 启用 → 用 saved credential 调 addUserToInbound 把 client 加回。
-					// addUserToInbound 内部会发现 GetUserInboundConfig 已有记录,自动复用 credential_json。
-					targetUserCopy, _ := repo.GetUser(ctx, username)
-					for _, cfg := range configs {
-						if err := addUserToInbound(ctx, remoteManage, repo, targetUserCopy, cfg.ServerID, cfg.InboundTag); err != nil {
-							log.Printf("[UserStatus] enable: add %s back to inbound %s on server %d failed: %v",
-								username, cfg.InboundTag, cfg.ServerID, err)
-						}
-					}
-					// 恢复 shared + user 两类 routed 子账户。
-					accessSync.resumeUserRoutedAccess(ctx, targetUserCopy)
-				}
-			}
+		if !payload.IsActive && shouldSyncAccess {
+			_ = repo.UpdateUserDisabledAccessEnforced(ctx, username, true)
 		}
 
 		// 推 limiter 配置,让 agent 内存 limiter UserInfo 跟 DB 状态对齐
@@ -525,28 +501,19 @@ func NewUserDeleteHandler(repo *storage.TrafficRepository, remoteManage *RemoteM
 			return
 		}
 
-		// 删除前从所有 xray inbound 里清掉该用户的 client，
-		// 否则节点上还残留着该用户的 uuid/password，套餐节点上会出现"幽灵用户"。
-		// 这里复用 packages.go 里的 removeUserFromInbound 路径，跟 PackageUnassign 行为一致。
+		// 物理入站、共享 routed、用户私有 routed 的 rule/client/outbound 必须
+		// 作为一份完整配置统一切换。任一 Agent 失败则用户和数据库均不删除。
 		if remoteManage != nil {
-			configs, cfgErr := repo.GetUserInboundConfigs(ctx, username)
-			if cfgErr != nil {
-				log.Printf("[UserDelete] get inbound configs for %s failed: %v", username, cfgErr)
+			if err := syncUserAccessTransactionally(ctx, repo, remoteManage, targetUser, false, true); err != nil {
+				writeError(w, http.StatusBadGateway, fmt.Errorf("用户未删除，Xray 配置事务失败: %w", err))
+				return
 			}
-			for _, cfg := range configs {
-				if err := removeUserFromInbound(ctx, remoteManage, cfg); err != nil {
-					log.Printf("[UserDelete] remove %s from inbound %s on server %d failed: %v",
-						username, cfg.InboundTag, cfg.ServerID, err)
-				}
-			}
-			if err := repo.DeleteUserInboundConfigs(ctx, username); err != nil {
-				log.Printf("[UserDelete] delete inbound config records for %s failed: %v", username, err)
-			}
-			// 级联清理用户私有路由出站(routed_owner='user'):删 xray 配置 + 删节点行
-			deleteUserPrivateRoutedAll(ctx, remoteManage, repo, username)
 		}
 
 		if err := repo.DeleteUser(ctx, username); err != nil {
+			if remoteManage != nil {
+				_ = syncUserAccessTransactionally(context.WithoutCancel(ctx), repo, remoteManage, targetUser, true, false)
+			}
 			if errors.Is(err, storage.ErrUserNotFound) {
 				writeError(w, http.StatusNotFound, errors.New("user not found"))
 				return

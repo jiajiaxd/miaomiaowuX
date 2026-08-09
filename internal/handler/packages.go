@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -435,21 +436,36 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if h.pusher != nil {
-		go h.pusher.PushToAllServersForPackage(context.Background(), req.ID)
-	}
-
 	// 套餐节点与用户凭据必须作为一次操作完成。这里不能后台异步：保存接口若先返回，用户立即
 	// 获取订阅会拿到刚生成的 SS2022 user key，但 Agent/Xray 的 clients 尚未写入，表现为
 	// “套餐里看得到节点但节点不通”。等同步结束后再返回，前端提示成功即代表凭据已经下发。
 	syncCtx, syncCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
 	defer syncCancel()
-	syncWarnings := h.syncInboundUsersAfterNodeChange(syncCtx, req.ID, oldNodes, nodes)
+	syncErr := h.syncPackageNodesTransactionally(syncCtx, req.ID, oldNodes, nodes)
+	if syncErr != nil {
+		rollbackWarnings := []string{}
+		if oldPkg != nil {
+			if err := h.repo.UpdatePackage(syncCtx, *oldPkg); err != nil {
+				rollbackWarnings = append(rollbackWarnings, "恢复旧套餐数据库配置失败: "+err.Error())
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":             "套餐节点同步失败，保存操作未生效",
+			"failures":          []string{syncErr.Error()},
+			"rollback_failures": rollbackWarnings,
+			"recovery_required": len(rollbackWarnings) > 0,
+		})
+		return
+	}
+	if h.pusher != nil {
+		go h.pusher.PushToAllServersForPackage(context.Background(), req.ID)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"message":  "Package updated successfully",
-		"warnings": syncWarnings,
+		"message": "Package updated successfully",
 	})
 }
 
@@ -587,6 +603,9 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 				node, err := h.repo.GetNodeByID(ctx, nodeID)
 				if err != nil {
 					log.Printf("[PackageUpdate] Failed to get node %d: %v", nodeID, err)
+					mu.Lock()
+					warnings = append(warnings, fmt.Sprintf("读取新增节点 %d 失败: %v", nodeID, err))
+					mu.Unlock()
 					return
 				}
 				if node.NodeType == "routed" {
@@ -598,6 +617,9 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 					item, err := collectRoutedBatchItem(ctx, h.remoteManage, h.repo, user, node.ID)
 					if err != nil {
 						log.Printf("[PackageUpdate] collect routed item user=%s node=%d failed: %v", user.Username, node.ID, err)
+						mu.Lock()
+						warnings = append(warnings, fmt.Sprintf("用户 %s 的路由节点 %s 准备失败: %v", user.Username, node.NodeName, err))
+						mu.Unlock()
 						return
 					}
 					if item != nil {
@@ -615,6 +637,9 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 				server, reason := resolveNodeServer(ctx, h.repo, h.remoteManage, node)
 				if server == nil {
 					log.Printf("[PackageUpdate] 跳过节点 %s 对用户 %s 的配置下发: %s", node.NodeName, user.Username, reason)
+					mu.Lock()
+					warnings = append(warnings, fmt.Sprintf("节点 %s 无法确定服务器: %s", node.NodeName, reason))
+					mu.Unlock()
 					return
 				}
 				// 同一 (user, server, inbound) 只收集一次 —— both 的 v4/v6 双节点共享同一入站,避免重复加 client。
@@ -648,6 +673,9 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 				defer bindWg.Done()
 				node, err := h.repo.GetNodeByID(ctx, nodeID)
 				if err != nil {
+					mu.Lock()
+					warnings = append(warnings, fmt.Sprintf("读取待移除节点 %d 失败: %v", nodeID, err))
+					mu.Unlock()
 					return
 				}
 				if node.NodeType == "routed" {
@@ -658,6 +686,9 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 					}
 					if err := removeUserFromRoutedNode(ctx, h.remoteManage, h.repo, user.Username, node.ID); err != nil {
 						log.Printf("[PackageUpdate] remove user %s from routed node %d failed: %v", user.Username, node.ID, err)
+						mu.Lock()
+						warnings = append(warnings, fmt.Sprintf("用户 %s 从路由节点 %s 移除失败: %v", user.Username, node.NodeName, err))
+						mu.Unlock()
 					}
 					return
 				}
@@ -666,6 +697,9 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 				}
 				server, _ := resolveNodeServer(ctx, h.repo, h.remoteManage, node)
 				if server == nil {
+					mu.Lock()
+					warnings = append(warnings, fmt.Sprintf("节点 %s 无法确定服务器，未能移除用户 %s", node.NodeName, user.Username))
+					mu.Unlock()
 					return
 				}
 				// 该入站仍被套餐里的其它节点占用(both 的 v4/v6 同入站)→ 不能摘 client。
@@ -683,6 +717,15 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 				mu.Unlock()
 				cfg, err := h.repo.GetUserInboundConfig(ctx, user.Username, server.ID, node.InboundTag)
 				if err != nil {
+					mu.Lock()
+					warnings = append(warnings, fmt.Sprintf("读取用户 %s 在节点 %s 的凭据失败: %v", user.Username, node.NodeName, err))
+					mu.Unlock()
+					return
+				}
+				if cfg == nil {
+					mu.Lock()
+					warnings = append(warnings, fmt.Sprintf("用户 %s 在节点 %s 的凭据记录不存在，无法确认移除", user.Username, node.NodeName))
+					mu.Unlock()
 					return
 				}
 				// 仅在 agent 确认摘除成功时才删 DB 登记行 —— 与 traffic_limit_enforcer.go 的 removed 守卫对齐。
@@ -691,9 +734,16 @@ func (h *PackageUpdateHandler) syncInboundUsersAfterNodeChange(ctx context.Conte
 				if err := removeUserFromInbound(ctx, h.remoteManage, *cfg); err != nil {
 					log.Printf("[PackageUpdate] Failed to remove user %s from inbound %s on server %d (keep DB row for retry): %v",
 						user.Username, cfg.InboundTag, cfg.ServerID, err)
+					mu.Lock()
+					warnings = append(warnings, fmt.Sprintf("用户 %s 从节点 %s 移除失败: %v", user.Username, node.NodeName, err))
+					mu.Unlock()
 					return
 				}
-				_ = h.repo.DeleteUserInboundConfig(ctx, user.Username, server.ID, node.InboundTag)
+				if err := h.repo.DeleteUserInboundConfig(ctx, user.Username, server.ID, node.InboundTag); err != nil {
+					mu.Lock()
+					warnings = append(warnings, fmt.Sprintf("删除用户 %s 在节点 %s 的凭据记录失败: %v", user.Username, node.NodeName, err))
+					mu.Unlock()
+				}
 			}(user, nodeID)
 		}
 	}
@@ -768,10 +818,56 @@ func NewPackageDeleteHandler(repo *storage.TrafficRepository, remoteManage *Remo
 	return &PackageDeleteHandler{repo: repo, remoteManage: remoteManage, pusher: pusher}
 }
 
-// unbindUserPackage 解除单个用户的套餐绑定:从入站移除凭据、删本地入站配置、推送 limiter、
-// 清空 package_id,并删除该用户残留的套餐订阅(历史 auto-gen)。best-effort,只记日志。
-func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher, username string) {
+// unbindUserPackage removes every physical and routed client through the same
+// coordinated whole-config transaction used by package updates. The package
+// row is cleared only after every Agent has activated and verified its target.
+func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher, username string) error {
+	user, err := repo.GetUser(ctx, username)
+	if err != nil {
+		return err
+	}
+	if user.PackageID <= 0 {
+		return nil
+	}
+	pkg, err := repo.GetPackage(ctx, user.PackageID)
+	if err != nil {
+		return err
+	}
+	updater := &PackageUpdateHandler{repo: repo, remoteManage: remoteManage, pusher: pusher}
+	if err := updater.syncPackageUserNodesTransactionally(ctx, []storage.User{user}, pkg.Nodes, nil); err != nil {
+		return fmt.Errorf("同步全部服务器解绑配置失败: %w", err)
+	}
+	if err := repo.RemovePackageFromUser(ctx, username); err != nil {
+		// The database mutation failed after Agents converged. Re-apply the old
+		// package as compensation; report both errors if recovery is incomplete.
+		rollbackErr := updater.syncPackageUserNodesTransactionally(context.WithoutCancel(ctx), []storage.User{user}, nil, pkg.Nodes)
+		return errors.Join(fmt.Errorf("清除套餐绑定失败: %w", err), rollbackErr)
+	}
+	if pusher != nil {
+		go pusher.PushToAllServersForUser(context.Background(), username)
+	}
+	if sf, err := repo.GetUserPackageSubscription(ctx, username); err == nil && sf.ID > 0 {
+		if derr := repo.DeleteSubscribeFile(ctx, sf.ID); derr != nil {
+			log.Printf("[PackageUnbind] 删除用户 %s 套餐订阅记录失败: %v", username, derr)
+		}
+		if sf.Filename != "" {
+			_ = os.Remove(filepath.Join("subscribes", sf.Filename))
+		}
+	}
+	return nil
+}
+
+// unbindUserPackageLegacy keeps the former incremental implementation for
+// reference during the rolling Agent upgrade. Strict paths do not call it.
+func unbindUserPackageLegacy(ctx context.Context, repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, pusher *LimiterConfigPusher, username string) error {
 	var mu sync.Mutex
+	var operationErrors []error
+	var removedPhysical []storage.UserInboundConfig
+	var removedRouted []int64
+	user, err := repo.GetUser(ctx, username)
+	if err != nil {
+		return err
+	}
 	// 只 routed 路径(改 routing rules)需要重启;普通 inbound remove-client 由 agent 热更新。
 	restartNeeded := map[int64]bool{}
 
@@ -781,6 +877,7 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 	configs, err := repo.GetUserInboundConfigs(ctx, username)
 	if err != nil {
 		log.Printf("[PackageUnbind] 获取用户 %s 入站配置失败: %v", username, err)
+		return fmt.Errorf("读取用户入站凭据失败: %w", err)
 	}
 	for _, cfg := range configs {
 		wg.Add(1)
@@ -788,18 +885,22 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 			defer wg.Done()
 			if err := removeUserFromInbound(ctx, remoteManage, cfg); err != nil {
 				log.Printf("[PackageUnbind] 从入站 %s(server %d)移除用户 %s 失败: %v", cfg.InboundTag, cfg.ServerID, username, err)
+				mu.Lock()
+				operationErrors = append(operationErrors, fmt.Errorf("从 server=%d inbound=%s 移除失败: %w", cfg.ServerID, cfg.InboundTag, err))
+				mu.Unlock()
 				return
 			}
-			// 只有远端确认摘除（含 runtime warning 自动恢复）后才删凭据记录；失败时保留，
-			// 供对账任务或再次解绑用同一凭据重试，避免生成同 email 的第二套 UUID。
-			if err := repo.DeleteUserInboundConfig(ctx, username, cfg.ServerID, cfg.InboundTag); err != nil {
-				log.Printf("[PackageUnbind] 删除用户 %s 入站 %s 凭据记录失败: %v", username, cfg.InboundTag, err)
-			}
+			mu.Lock()
+			removedPhysical = append(removedPhysical, cfg)
+			mu.Unlock()
 		}(cfg)
 	}
 
 	// 子账号路径:从所有 active routed 节点下线(凭据保留,续费可恢复)
-	subaccs, _ := repo.ListUserSubaccounts(ctx, username)
+	subaccs, subErr := repo.ListUserSubaccounts(ctx, username)
+	if subErr != nil {
+		return fmt.Errorf("读取路由子账户失败: %w", subErr)
+	}
 	for _, sa := range subaccs {
 		if !sa.IsActive {
 			continue
@@ -816,17 +917,40 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 			}
 			if err := removeUserFromRoutedNode(ctx, remoteManage, repo, username, routedNodeID); err != nil {
 				log.Printf("[PackageUnbind] routed node %d 下线用户 %s 失败: %v", routedNodeID, username, err)
+				mu.Lock()
+				operationErrors = append(operationErrors, fmt.Errorf("从路由节点 %d 移除失败: %w", routedNodeID, err))
+				mu.Unlock()
+				return
 			}
+			mu.Lock()
+			removedRouted = append(removedRouted, routedNodeID)
+			mu.Unlock()
 		}(sa.RoutedNodeID)
 	}
 	wg.Wait()
+	if len(operationErrors) > 0 {
+		rollbackErr := restoreUnbindChanges(ctx, repo, remoteManage, user, removedPhysical, removedRouted, restartNeeded)
+		return errors.Join(errors.Join(operationErrors...), rollbackErr)
+	}
 
-	restartXrayInParallel(ctx, remoteManage, restartNeeded, "PackageUnbind")
+	if err := restartXrayInParallelStrict(ctx, remoteManage, restartNeeded, "PackageUnbind"); err != nil {
+		rollbackErr := restoreUnbindChanges(ctx, repo, remoteManage, user, removedPhysical, removedRouted, restartNeeded)
+		return errors.Join(err, rollbackErr)
+	}
+	// Agent configuration is now confirmed. Only now remove physical credential
+	// rows; until this point they are the durable rollback source.
+	for _, cfg := range removedPhysical {
+		if err := repo.DeleteUserInboundConfig(ctx, username, cfg.ServerID, cfg.InboundTag); err != nil {
+			rollbackErr := restoreUnbindChanges(ctx, repo, remoteManage, user, removedPhysical, removedRouted, restartNeeded)
+			return errors.Join(fmt.Errorf("删除 inbound=%s 凭据记录失败: %w", cfg.InboundTag, err), rollbackErr)
+		}
+	}
 	if pusher != nil {
 		go pusher.PushToAllServersForUser(context.Background(), username)
 	}
 	if err := repo.RemovePackageFromUser(ctx, username); err != nil && err != storage.ErrUserNotFound {
 		log.Printf("[PackageUnbind] 解绑用户 %s 套餐失败: %v", username, err)
+		return err
 	}
 	// 删除该用户残留的套餐订阅(历史 auto-gen 文件)
 	if sf, err := repo.GetUserPackageSubscription(ctx, username); err == nil && sf.ID > 0 {
@@ -837,6 +961,25 @@ func unbindUserPackage(ctx context.Context, repo *storage.TrafficRepository, rem
 			_ = os.Remove(filepath.Join("subscribes", sf.Filename))
 		}
 	}
+	return nil
+}
+
+func restoreUnbindChanges(ctx context.Context, repo *storage.TrafficRepository, remoteManage *RemoteManageHandler, user storage.User, physical []storage.UserInboundConfig, routed []int64, restartNeeded map[int64]bool) error {
+	var errs []error
+	for _, cfg := range physical {
+		if err := addUserToInbound(ctx, remoteManage, repo, user, cfg.ServerID, cfg.InboundTag); err != nil {
+			errs = append(errs, fmt.Errorf("rollback inbound server=%d tag=%s: %w", cfg.ServerID, cfg.InboundTag, err))
+		}
+	}
+	for _, nodeID := range routed {
+		if err := addUserToRoutedNode(ctx, remoteManage, repo, user, nodeID); err != nil {
+			errs = append(errs, fmt.Errorf("rollback routed node=%d: %w", nodeID, err))
+		}
+	}
+	if err := restartXrayInParallelStrict(ctx, remoteManage, restartNeeded, "PackageUnbindRollback"); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func (h *PackageDeleteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -878,21 +1021,8 @@ func (h *PackageDeleteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 
 	ctx := r.Context()
 
-	// 删除套餐前,先把绑定该套餐的所有用户解绑(移除入站凭据 + 清 package_id + 删套餐订阅),
-	// 否则会残留无效绑定和孤立订阅。
-	unbound := 0
-	if users, err := h.repo.ListUsersWithPackage(ctx); err == nil {
-		for _, u := range users {
-			if u.PackageID == id {
-				unbindUserPackage(ctx, h.repo, h.remoteManage, h.pusher, u.Username)
-				unbound++
-			}
-		}
-	} else {
-		log.Printf("[PackageDelete] 获取绑定用户列表失败: %v", err)
-	}
-
-	if err := h.repo.DeletePackage(ctx, id); err != nil {
+	pkg, err := h.repo.GetPackage(ctx, id)
+	if err != nil {
 		if err == storage.ErrPackageNotFound {
 			http.Error(w, "Package not found", http.StatusNotFound)
 			return
@@ -900,11 +1030,73 @@ func (h *PackageDeleteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	users, err := h.repo.ListUsersWithPackage(ctx)
+	if err != nil {
+		http.Error(w, "读取套餐用户失败: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	targetUsers := make([]storage.User, 0)
+	snapshots := make([]*storage.UserPackageAssignmentSnapshot, 0)
+	for _, user := range users {
+		if user.PackageID != id {
+			continue
+		}
+		snapshot, snapshotErr := h.repo.GetUserPackageAssignmentSnapshot(ctx, user.Username)
+		if snapshotErr != nil {
+			http.Error(w, "保存用户套餐状态失败: "+snapshotErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		targetUsers = append(targetUsers, user)
+		snapshots = append(snapshots, snapshot)
+	}
+
+	updater := &PackageUpdateHandler{repo: h.repo, remoteManage: h.remoteManage, pusher: h.pusher}
+	if err := updater.syncPackageUserNodesTransactionally(ctx, targetUsers, pkg.Nodes, nil); err != nil {
+		http.Error(w, "套餐删除失败，所有用户与节点配置均已保留: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	// Agent 已整体切换后再提交用户绑定。任一数据库写入失败，恢复全部
+	// assignment，并以另一笔完整配置事务恢复全部 Agent。
+	var databaseErr error
+	for _, user := range targetUsers {
+		if err := h.repo.RemovePackageFromUser(ctx, user.Username); err != nil {
+			databaseErr = fmt.Errorf("清除用户 %s 套餐绑定: %w", user.Username, err)
+			break
+		}
+	}
+	if databaseErr == nil {
+		databaseErr = h.repo.DeletePackage(ctx, id)
+	}
+	if databaseErr != nil {
+		var recoveryErrs []error
+		for _, snapshot := range snapshots {
+			if err := h.repo.RestoreUserPackageAssignment(context.WithoutCancel(ctx), snapshot); err != nil {
+				recoveryErrs = append(recoveryErrs, err)
+			}
+		}
+		if err := updater.syncPackageUserNodesTransactionally(context.WithoutCancel(ctx), targetUsers, nil, pkg.Nodes); err != nil {
+			recoveryErrs = append(recoveryErrs, err)
+		}
+		http.Error(w, errors.Join(fmt.Errorf("套餐删除数据库提交失败: %w", databaseErr), errors.Join(recoveryErrs...)).Error(), http.StatusInternalServerError)
+		return
+	}
+
+	for _, user := range targetUsers {
+		if h.pusher != nil {
+			go h.pusher.PushToAllServersForUser(context.Background(), user.Username)
+		}
+		if sf, getErr := h.repo.GetUserPackageSubscription(ctx, user.Username); getErr == nil && sf.ID > 0 {
+			_ = h.repo.DeleteSubscribeFile(ctx, sf.ID)
+			if sf.Filename != "" {
+				_ = os.Remove(filepath.Join("subscribes", sf.Filename))
+			}
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"message":       "Package deleted successfully",
-		"unbound_users": unbound,
+		"unbound_users": len(targetUsers),
 	})
 }
 
@@ -940,44 +1132,12 @@ func (h *PackageUnassignHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 
 	ctx := r.Context()
 
-	// 先从入站中移除用户凭据
-	configs, err := h.repo.GetUserInboundConfigs(ctx, req.Username)
-	if err != nil {
-		log.Printf("[PackageUnassign] Failed to get user inbound configs: %v", err)
-	}
-	for _, cfg := range configs {
-		if err := removeUserFromInbound(ctx, h.remoteManage, cfg); err != nil {
-			log.Printf("[PackageUnassign] Failed to remove user %s from inbound %s on server %d: %v",
-				req.Username, cfg.InboundTag, cfg.ServerID, err)
-			continue
-		}
-		if err := h.repo.DeleteUserInboundConfig(ctx, req.Username, cfg.ServerID, cfg.InboundTag); err != nil {
-			log.Printf("[PackageUnassign] Failed to delete user %s inbound %s credential record: %v",
-				req.Username, cfg.InboundTag, err)
-		}
-	}
-
-	// 路由出站子账号:从 active 状态下线,凭据保留供续费恢复。
-	subaccs, _ := h.repo.ListUserSubaccounts(ctx, req.Username)
-	for _, sa := range subaccs {
-		if !sa.IsActive {
-			continue
-		}
-		if err := removeUserFromRoutedNode(ctx, h.remoteManage, h.repo, req.Username, sa.RoutedNodeID); err != nil {
-			log.Printf("[PackageUnassign] routed node %d 下线用户 %s 失败: %v", sa.RoutedNodeID, req.Username, err)
-		}
-	}
-
-	if h.pusher != nil {
-		go h.pusher.PushToAllServersForUser(context.Background(), req.Username)
-	}
-
-	if err := h.repo.RemovePackageFromUser(ctx, req.Username); err != nil {
+	if err := unbindUserPackage(ctx, h.repo, h.remoteManage, h.pusher, req.Username); err != nil {
 		if err == storage.ErrUserNotFound {
 			http.Error(w, "User not found", http.StatusNotFound)
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, "套餐解绑失败，原套餐绑定已保留: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 
@@ -1112,6 +1272,50 @@ func (h *PackageAssignHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 // AssignAndProvision 绑定套餐并真正下发(给套餐节点 inbound 加用户凭据 + 批量推服务器 + 重启 xray + 推限速)。
 // 抽自 ServeHTTP,供 web /api/admin/packages/assign 与 TGBOT 注册/兑换共用,确保两条路都生效。
 func (h *PackageAssignHandler) AssignAndProvision(ctx context.Context, username string, packageID int64, startDate, endDate time.Time, isReset bool, resetDay int) ([]string, error) {
+	snapshot, err := h.repo.GetUserPackageAssignmentSnapshot(ctx, username)
+	if err != nil {
+		return nil, err
+	}
+	newPackage, err := h.repo.GetPackage(ctx, packageID)
+	if err != nil {
+		return nil, err
+	}
+	var oldNodes []int64
+	if snapshot.PackageID != nil && *snapshot.PackageID != packageID {
+		if previousPackage, getErr := h.repo.GetPackage(ctx, *snapshot.PackageID); getErr == nil && previousPackage != nil {
+			oldNodes = previousPackage.Nodes
+		}
+	}
+	// Rebinding the same package is an explicit consistency repair. Treat every
+	// package node as an addition so missing clients/routed users are rebuilt in
+	// the complete candidate instead of returning early.
+	if snapshot.PackageID != nil && *snapshot.PackageID == packageID {
+		oldNodes = nil
+	}
+
+	if err := h.repo.AssignPackageToUser(ctx, username, packageID, startDate, endDate, isReset, resetDay); err != nil {
+		return nil, err
+	}
+	user, err := h.repo.GetUser(ctx, username)
+	if err != nil {
+		_ = h.repo.RestoreUserPackageAssignment(context.WithoutCancel(ctx), snapshot)
+		return nil, err
+	}
+	updater := &PackageUpdateHandler{repo: h.repo, remoteManage: h.remoteManage, pusher: h.pusher}
+	if err := updater.syncPackageUserNodesTransactionally(ctx, []storage.User{user}, oldNodes, newPackage.Nodes); err != nil {
+		restoreErr := h.repo.RestoreUserPackageAssignment(context.WithoutCancel(ctx), snapshot)
+		return nil, errors.Join(fmt.Errorf("套餐配置未能在全部服务器生效: %w", err), restoreErr)
+	}
+	if h.pusher != nil {
+		go h.pusher.PushToAllServersForUser(context.Background(), username)
+	}
+	return nil, nil
+}
+
+// assignAndProvisionLegacy is retained temporarily for rolling upgrades with
+// old Agents. New call sites use the coordinated whole-config transaction
+// above; strict operations never fall back to this partial-success path.
+func (h *PackageAssignHandler) assignAndProvisionLegacy(ctx context.Context, username string, packageID int64, startDate, endDate time.Time, isReset bool, resetDay int) ([]string, error) {
 	var warnings []string
 
 	// "套餐未变"的纯续期 / 改到期路径:用户当前就绑着这个 package,client 早已下发到各节点入站,
@@ -1424,6 +1628,31 @@ func restartXrayInParallel(ctx context.Context, rm *RemoteManageHandler, serverI
 		}(sid)
 	}
 	wg.Wait()
+}
+
+// restartXrayInParallelStrict is used by operations that promise all-or-fail
+// semantics. Unlike the legacy best-effort helper it returns every failed
+// target so the caller must not commit the package/user state.
+func restartXrayInParallelStrict(ctx context.Context, rm *RemoteManageHandler, serverIDs map[int64]bool, logPrefix string) error {
+	if len(serverIDs) == 0 {
+		return nil
+	}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []error
+	for sid := range serverIDs {
+		wg.Add(1)
+		go func(serverID int64) {
+			defer wg.Done()
+			if err := rm.restartXrayWithRecovery(ctx, serverID, logPrefix); err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("server %d restart xray: %w", serverID, err))
+				mu.Unlock()
+			}
+		}(sid)
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // inboundCredLocks 串行化同一 (user, server, inbound) 的凭据生成 + 写 DB。

@@ -15,6 +15,8 @@ import (
 
 	"miaomiaowux/internal/license"
 	"miaomiaowux/internal/storage"
+
+	"github.com/google/uuid"
 )
 
 // routingMutateLocks 是 auto-detected routed 节点更新 routing rule 时的 per-server 锁。
@@ -332,25 +334,56 @@ func (h *RoutedOutboundHandler) delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. 移除 routing rule(按 marktag 找到 index 然后 remove_rule)
-	removeRuleByMarktag(ctx, h.remoteManage, serverID, detail.RoutedRuleMarktag)
-
-	// 2. 移除 outbound
-	rmOutBody, _ := json.Marshal(map[string]string{"action": "remove", "tag": detail.RoutedOutboundTag})
-	h.remoteManage.forwardToRemoteServer(ctx, serverID, "POST", "/api/child/outbounds", rmOutBody)
-
-	// 3. 移除 admin client(以及所有子账号 client — 通过 user_subaccounts 反查)
-	subaccs, _ := h.repo.ListSubaccountsByRoutedNode(ctx, id)
-	for _, sa := range subaccs {
-		removeClientFromInbound(ctx, h.remoteManage, serverID, detail.InboundTag, sa.Email)
+	state, err := loadPackageServerConfig(ctx, h.remoteManage, map[int64]*packageConfigState{}, serverID)
+	if err != nil {
+		writeJSONError(w, http.StatusBadGateway, "读取 Agent 完整配置失败: "+err.Error())
+		return
 	}
-	removeClientFromInbound(ctx, h.remoteManage, serverID, detail.InboundTag, detail.RoutedAdminEmail)
+	if err := removeManagedRoute(state.config, detail.RoutedRuleMarktag); err != nil {
+		writeJSONError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	removeTaggedConfigEntry(state.config, "outbounds", detail.RoutedOutboundTag)
+	subaccs, err := h.repo.ListSubaccountsByRoutedNode(ctx, id)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "读取路由子账户失败: "+err.Error())
+		return
+	}
+	for _, sa := range subaccs {
+		if err := removeManagedClient(state.config, detail.InboundTag, sa.Email); err != nil {
+			writeJSONError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+	}
+	if err := removeManagedClient(state.config, detail.InboundTag, detail.RoutedAdminEmail); err != nil {
+		writeJSONError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if err := validateManagedConfig(state.config); err != nil {
+		writeJSONError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	candidate, err := json.MarshalIndent(state.config, "", "  ")
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	operationID := "routed-delete-" + uuid.NewString()
+	targets := []xrayConfigTransactionTarget{{ServerID: serverID, Config: string(candidate)}}
+	if err := applyXrayConfigTransaction(ctx, h.remoteManage, operationID, targets); err != nil {
+		writeJSONError(w, http.StatusBadGateway, "删除路由配置失败，节点已保留: "+err.Error())
+		return
+	}
 
-	// 4. 删 DB 行(级联清 user_subaccounts via FK)
 	if err := h.repo.DeleteRoutedNode(ctx, id); err != nil {
+		_ = finishXrayConfigTransaction(context.WithoutCancel(ctx), h.remoteManage, operationID, targets, false)
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("DB 删除失败: %v", err))
 		return
 	}
+	if err := finishXrayConfigTransaction(context.WithoutCancel(ctx), h.remoteManage, operationID, targets, true); err != nil {
+		log.Printf("[RoutedOutbound] delete operation %s committed; agent cleanup incomplete: %v", operationID, err)
+	}
+	go h.remoteManage.refreshXraySnapshot(serverID)
 	respondJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 

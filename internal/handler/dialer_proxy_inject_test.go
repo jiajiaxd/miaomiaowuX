@@ -112,8 +112,19 @@ func TestTrafficLimitEnforcerSuspendsSharedRoutedSubaccount(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(paths) != 2 || paths[0] != "/api/child/routing" || paths[1] != "/api/child/inbounds" {
-		t.Fatalf("unexpected agent calls: %v", paths)
+	// Mutating Agent calls may trigger an asynchronous full-config snapshot
+	// refresh. Assert the two required writes without coupling this test to the
+	// refresh implementation or goroutine ordering.
+	required := map[string]bool{"/api/child/routing": false, "/api/child/inbounds": false}
+	for _, path := range paths {
+		if _, ok := required[path]; ok {
+			required[path] = true
+		}
+	}
+	for path, seen := range required {
+		if !seen {
+			t.Fatalf("missing agent call %s; got %v", path, paths)
+		}
 	}
 }
 

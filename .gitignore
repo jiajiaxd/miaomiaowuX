@@ -63,5 +63,6 @@ MCP_PLAN.md
 !internal/storage/remote_heartbeat_notification_test.go
 !internal/storage/server_renewal_confirm_test.go
 !internal/handler/traffic_period_baseline_test.go
+!internal/handler/package_config_transaction_test.go
 !internal/license/ip_region_test.go
 AGENTS.md

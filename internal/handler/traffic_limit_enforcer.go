@@ -153,17 +153,18 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) (string, error) {
 		if user.PackageEndDate != nil && now.After(*user.PackageEndDate) {
 			log.Printf("[TrafficLimitEnforcer] User %s package expired at %s, removing from inbounds and clearing package",
 				user.Username, user.PackageEndDate.Format("2006-01-02"))
-			removed := e.removeUserFromAllInbounds(ctx, user.Username)
-			routedRemoved := e.suspendUserRoutedAccess(ctx, user.Username)
-			if !removed || !routedRemoved {
+			pkg, pkgErr := e.repo.GetPackage(ctx, user.PackageID)
+			if pkgErr != nil || pkg == nil {
+				log.Printf("[TrafficLimitEnforcer] User %s expiry cannot load package %d: %v", user.Username, user.PackageID, pkgErr)
+				continue
+			}
+			updater := &PackageUpdateHandler{repo: e.repo, remoteManage: e.remoteManage, pusher: e.pusher}
+			if err := updater.syncPackageUserNodesTransactionally(ctx, []storage.User{user}, pkg.Nodes, nil); err != nil {
 				// agent 摘除未确认成功(多半离线):保留 user_inbound_configs 与套餐绑定,下个周期重试。
 				// 不在此清 DB —— 否则 agent 残留孤儿 client 而 DB 无行,既造成「同 email 不同 uuid」漂移,
 				// 过期用户还因孤儿 client 继续有访问权。也暂不发到期通知,避免每周期反复打扰。
-				log.Printf("[TrafficLimitEnforcer] User %s expiry removal incomplete (agent unreachable?), keep configs & retry next cycle", user.Username)
+				log.Printf("[TrafficLimitEnforcer] User %s expiry transaction failed, keep package and retry next cycle: %v", user.Username, err)
 				continue
-			}
-			if err := e.repo.DeleteUserInboundConfigs(ctx, user.Username); err != nil {
-				log.Printf("[TrafficLimitEnforcer] Failed to delete inbound configs for %s: %v", user.Username, err)
 			}
 			if err := e.repo.RemoveExpiredPackageFromUser(ctx, user.Username); err != nil {
 				log.Printf("[TrafficLimitEnforcer] Failed to remove package from %s: %v", user.Username, err)
