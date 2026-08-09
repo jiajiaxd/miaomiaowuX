@@ -14,6 +14,18 @@ import (
 
 const realityGuardTagPrefix = "mmwx-reality-guard-"
 
+const realityGuardStealSelfMessage = "偷自己服务器不能开启 Reality 防偷；两者都会改写 Reality 伪装目标和 tunnel 路由"
+
+func validateRealityGuardStealMode(stealMode string, requested *bool) error {
+	if requested == nil || !*requested {
+		return nil
+	}
+	if stealMode == "tunnel" || stealMode == "fallback" {
+		return fmt.Errorf("%s", realityGuardStealSelfMessage)
+	}
+	return nil
+}
+
 func realityGuardTag(inboundTag string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(inboundTag)))
 	return realityGuardTagPrefix + hex.EncodeToString(sum[:8])

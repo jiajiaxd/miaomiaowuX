@@ -2619,6 +2619,19 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 			}
 		}
 	}
+	// Reality 防偷会把主入站 dest 改为本地 helper tunnel；偷自己同样依赖 tunnel/fallback
+	// 拓扑改写，两套编排不能叠加。必须在任何 Agent 写入前拒绝，避免绕过前端造成半套配置。
+	if realityGuardRequested != nil && *realityGuardRequested {
+		server, getErr := h.repo.GetRemoteServer(r.Context(), id)
+		if getErr != nil || server == nil {
+			remoteWriteError(w, http.StatusInternalServerError, "读取服务器配置失败，无法校验 Reality 防偷")
+			return
+		}
+		if guardErr := validateRealityGuardStealMode(server.StealMode, realityGuardRequested); guardErr != nil {
+			remoteWriteError(w, http.StatusBadRequest, guardErr.Error())
+			return
+		}
+	}
 
 	// update = 修改节点对应的入站:服务端强制保留原协议 + 原凭据(不信任前端),先删旧入站,
 	// 再改写成 add 走后续预处理/下发,最后发 EventInboundUpdated(原地更新 v4/v6 节点,不重建)。

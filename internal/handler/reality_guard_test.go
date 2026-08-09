@@ -101,6 +101,23 @@ func TestRealityGuardUsesReservedTag(t *testing.T) {
 	}
 }
 
+func TestValidateRealityGuardStealMode(t *testing.T) {
+	on, off := true, false
+	for _, mode := range []string{"tunnel", "fallback"} {
+		if err := validateRealityGuardStealMode(mode, &on); err == nil {
+			t.Fatalf("mode %q allowed Reality guard", mode)
+		}
+		if err := validateRealityGuardStealMode(mode, &off); err != nil {
+			t.Fatalf("mode %q rejected disabled guard: %v", mode, err)
+		}
+	}
+	for _, mode := range []string{"", "default"} {
+		if err := validateRealityGuardStealMode(mode, &on); err != nil {
+			t.Fatalf("mode %q rejected Reality guard: %v", mode, err)
+		}
+	}
+}
+
 func TestFilterInboundsHidesRealityGuardAndRestoresEditFields(t *testing.T) {
 	config := testRealityGuardConfig()
 	tag := "vless-reality-443"
