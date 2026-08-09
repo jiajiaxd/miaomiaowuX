@@ -162,7 +162,10 @@ chmod +x mmwx-linux-amd64
 | `region` / `region_country` / `region_name` / `region_city` | string | 地区 Emoji、国家、完整地域与城市 |
 | `provider_name` / `provider_url` / `telecom_paid_peer` | string / boolean | 服务商信息与 163 Paid Peer 标记 |
 | `upload_speed` / `download_speed` | B/s | 当前上下行网速 |
-| `traffic_used` / `traffic_limit` | byte | 当前重置周期用量及限额 |
+| `traffic_used` / `traffic_limit` | byte | 按服务器统计模式计算的当前周期计费用量及限额 |
+| `traffic_used_up` / `traffic_used_down` | byte | 当前周期实际上行、下行流量 |
+| `traffic_used_total` | byte | 当前周期实际上下行合计 |
+| `period_start` / `period_end` | `YYYY-MM-DD` | 当前计费周期起点（含）与下一重置日（不含） |
 | `cumulative_up` / `cumulative_down` | byte | 系统网卡当前周期累计上下行 |
 | `daily_traffic` | array | `{date, uplink, downlink, total}` 每日流量 |
 | `cpu_pct` / `loadavg` | % / string | CPU 使用率与负载 |

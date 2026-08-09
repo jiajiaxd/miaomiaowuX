@@ -72,10 +72,15 @@ type probeServer struct {
 	ProviderURL     string `json:"provider_url,omitempty"`
 	TelecomPaidPeer bool   `json:"telecom_paid_peer,omitempty"`
 	// 网速/流量是展示开关控制的:关闭时置 nil + omitempty,整个字段消失,前端据此隐藏。
-	UploadSpeed   *int64 `json:"upload_speed,omitempty"`   // B/s(当前上行速率)
-	DownloadSpeed *int64 `json:"download_speed,omitempty"` // B/s(当前下行速率)
-	TrafficUsed   *int64 `json:"traffic_used,omitempty"`
-	TrafficLimit  *int64 `json:"traffic_limit,omitempty"`
+	UploadSpeed      *int64 `json:"upload_speed,omitempty"`       // B/s(当前上行速率)
+	DownloadSpeed    *int64 `json:"download_speed,omitempty"`     // B/s(当前下行速率)
+	TrafficUsed      *int64 `json:"traffic_used,omitempty"`       // 兼容字段：按 traffic_stats_mode 计费后的周期用量
+	TrafficUsedUp    *int64 `json:"traffic_used_up,omitempty"`    // 当前周期实际上行
+	TrafficUsedDown  *int64 `json:"traffic_used_down,omitempty"`  // 当前周期实际下行
+	TrafficUsedTotal *int64 `json:"traffic_used_total,omitempty"` // 当前周期实际上下行合计
+	TrafficLimit     *int64 `json:"traffic_limit,omitempty"`
+	PeriodStart      string `json:"period_start,omitempty"` // 当前计费周期起点（含），YYYY-MM-DD
+	PeriodEnd        string `json:"period_end,omitempty"`   // 下一重置日（不含），YYYY-MM-DD
 	// 累计上/下行流量(系统级 rx/tx cycle):图2 底部"已用上下行"。仅 system-source 有值,
 	// 其余为 0 → 前端隐藏该行。受 onTraffic 门控。
 	CumulativeUp   *int64 `json:"cumulative_up,omitempty"`   // 累计上行(SystemTxCycle)
@@ -251,6 +256,17 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		if onTraffic {
 			tu, tl := used, s.TrafficLimit
 			ps.TrafficUsed, ps.TrafficLimit = &tu, &tl
+			var periodUp, periodDown int64
+			for _, day := range ps.DailyTraffic {
+				periodUp += day.Uplink
+				periodDown += day.Downlink
+			}
+			periodTotal := periodUp + periodDown
+			ps.TrafficUsedUp, ps.TrafficUsedDown, ps.TrafficUsedTotal = &periodUp, &periodDown, &periodTotal
+			if start, end, ok := serverTrafficPeriod(time.Now(), s.TrafficResetDay); ok {
+				ps.PeriodStart = start.Format("2006-01-02")
+				ps.PeriodEnd = end.Format("2006-01-02")
+			}
 			// 累计上下行:仅 system-source 服务器有 rx/tx cycle;>0 才带(前端据此显示"已用上下行"行)。
 			if s.SystemTxCycle > 0 || s.SystemRxCycle > 0 {
 				up, down := s.SystemTxCycle, s.SystemRxCycle
@@ -309,6 +325,18 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		}
 	}
 	return payload, nil
+}
+
+// serverTrafficPeriod returns [start,end), matching the reset-day projection
+// used by daily_traffic. end is the next reset boundary, not the last included
+// calendar day, so consumers can compare timestamps without special casing.
+func serverTrafficPeriod(now time.Time, resetDay int) (start, end time.Time, ok bool) {
+	if resetDay < 1 || resetDay > 31 {
+		return time.Time{}, time.Time{}, false
+	}
+	start = prevResetDate(now, resetDay)
+	end = nextResetDate(start.AddDate(0, 0, 1), resetDay)
+	return start, end, true
 }
 
 // loadDailyTraffic caches the current reset-cycle ledger projection for one minute.

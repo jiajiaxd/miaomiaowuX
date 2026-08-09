@@ -36,6 +36,15 @@ CREATE TABLE IF NOT EXISTS traffic_daily_users (
     FOREIGN KEY (server_id) REFERENCES remote_servers(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_traffic_daily_users_date ON traffic_daily_users(date);
+CREATE TABLE IF NOT EXISTS traffic_daily_users_archived (
+    username TEXT NOT NULL,
+    date TEXT NOT NULL,
+    uplink INTEGER NOT NULL DEFAULT 0,
+    downlink INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (username, date)
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_daily_users_archived_date ON traffic_daily_users_archived(date);
 CREATE TABLE IF NOT EXISTS traffic_daily_user_emails (
     server_id INTEGER NOT NULL,
     email TEXT NOT NULL,
@@ -399,7 +408,11 @@ func (r *TrafficRepository) ListDailyUserTraffic(ctx context.Context, rangeName 
 	if err != nil {
 		return nil, "", "", err
 	}
-	rows, err := r.db.QueryContext(ctx, `SELECT username,SUM(uplink),SUM(downlink) FROM traffic_daily_users WHERE date>=? AND date<=? GROUP BY username`, start, end)
+	rows, err := r.db.QueryContext(ctx, `SELECT username,SUM(uplink),SUM(downlink) FROM (
+		SELECT username,uplink,downlink FROM traffic_daily_users WHERE date>=? AND date<=?
+		UNION ALL
+		SELECT username,uplink,downlink FROM traffic_daily_users_archived WHERE date>=? AND date<=?
+	) AS user_days GROUP BY username`, start, end, start, end)
 	if err != nil {
 		return nil, "", "", err
 	}

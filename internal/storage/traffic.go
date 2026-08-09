@@ -2762,6 +2762,16 @@ CREATE INDEX IF NOT EXISTS idx_user_email_traffic_email ON user_email_traffic(em
 	if _, err := r.db.Exec(userEmailTrafficSchema); err != nil {
 		return fmt.Errorf("migrate user_email_traffic: %w", err)
 	}
+	const userTrafficCarrySchema = `
+CREATE TABLE IF NOT EXISTS user_traffic_cycle_carry (
+    username TEXT PRIMARY KEY,
+    weighted_uplink REAL NOT NULL DEFAULT 0,
+    weighted_downlink REAL NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);`
+	if _, err := r.db.Exec(userTrafficCarrySchema); err != nil {
+		return fmt.Errorf("migrate user traffic cycle carry: %w", err)
+	}
 	if err := r.migrateDailyTrafficLedger(); err != nil {
 		return fmt.Errorf("migrate daily traffic ledger: %w", err)
 	}
@@ -5690,6 +5700,8 @@ func purgeUserTrafficHistoryTx(ctx context.Context, tx *dialectTx, username stri
 	// Snapshot rows have no attributed_username column, so remove snapshots for
 	// the exact email rows before deleting user_email_traffic itself.
 	statements := []string{
+		`DELETE FROM user_traffic_cycle_carry WHERE username = ?`,
+		`DELETE FROM traffic_daily_users_archived WHERE username = ?`,
 		`DELETE FROM user_email_traffic_snapshots WHERE EXISTS (
 			SELECT 1 FROM user_email_traffic uet
 			WHERE uet.server_id = user_email_traffic_snapshots.server_id
@@ -10269,9 +10281,11 @@ func (r *TrafficRepository) GetUserBillableTraffic(ctx context.Context, username
 	}
 	var billable float64
 	err := r.db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(MAX(weighted_uplink - cycle_base_weighted_uplink, 0)
-		                   + MAX(weighted_downlink - cycle_base_weighted_downlink, 0)), 0)
-		 FROM user_email_traffic WHERE attributed_username = ?`, username).Scan(&billable)
+		`SELECT COALESCE((SELECT SUM(
+		             CASE WHEN weighted_uplink > cycle_base_weighted_uplink THEN weighted_uplink-cycle_base_weighted_uplink ELSE 0 END
+		           + CASE WHEN weighted_downlink > cycle_base_weighted_downlink THEN weighted_downlink-cycle_base_weighted_downlink ELSE 0 END)
+		          FROM user_email_traffic WHERE attributed_username = ?), 0)
+		      + COALESCE((SELECT weighted_uplink+weighted_downlink FROM user_traffic_cycle_carry WHERE username = ?), 0)`, username, username).Scan(&billable)
 	if err != nil {
 		return 0, fmt.Errorf("query billable traffic: %w", err)
 	}
@@ -10294,9 +10308,10 @@ func (r *TrafficRepository) GetUserBillableTrafficByDirection(ctx context.Contex
 	}
 	var up, down float64
 	err := r.db.QueryRowContext(ctx,
-		`SELECT COALESCE(SUM(MAX(weighted_uplink - cycle_base_weighted_uplink, 0)), 0),
-		        COALESCE(SUM(MAX(weighted_downlink - cycle_base_weighted_downlink, 0)), 0)
-		 FROM user_email_traffic WHERE attributed_username = ?`, username).Scan(&up, &down)
+		`SELECT COALESCE((SELECT SUM(CASE WHEN weighted_uplink > cycle_base_weighted_uplink THEN weighted_uplink-cycle_base_weighted_uplink ELSE 0 END) FROM user_email_traffic WHERE attributed_username = ?), 0)
+		             + COALESCE((SELECT weighted_uplink FROM user_traffic_cycle_carry WHERE username = ?), 0),
+		        COALESCE((SELECT SUM(CASE WHEN weighted_downlink > cycle_base_weighted_downlink THEN weighted_downlink-cycle_base_weighted_downlink ELSE 0 END) FROM user_email_traffic WHERE attributed_username = ?), 0)
+		             + COALESCE((SELECT weighted_downlink FROM user_traffic_cycle_carry WHERE username = ?), 0)`, username, username, username, username).Scan(&up, &down)
 	if err != nil {
 		return 0, 0, fmt.Errorf("query billable traffic by direction: %w", err)
 	}
@@ -10327,7 +10342,23 @@ func (r *TrafficRepository) GetAllUserBillableTraffic(ctx context.Context) (map[
 		}
 		out[username] = int64(billable)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	carryRows, err := r.db.QueryContext(ctx, `SELECT username, weighted_uplink + weighted_downlink FROM user_traffic_cycle_carry`)
+	if err != nil {
+		return nil, fmt.Errorf("query carried billable traffic: %w", err)
+	}
+	defer carryRows.Close()
+	for carryRows.Next() {
+		var username string
+		var billable float64
+		if err := carryRows.Scan(&username, &billable); err != nil {
+			return nil, err
+		}
+		out[username] += int64(billable)
+	}
+	return out, carryRows.Err()
 }
 
 func (r *TrafficRepository) UpdateUserLimitOverrides(ctx context.Context, username string, speedOverride *float64, deviceOverride *int) error {
@@ -12449,6 +12480,29 @@ func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64) er
 	// 3) server_id 关联的数据:活跃运营(凭据/出站/xray 快照/批量记录/到期通知 flag)+ 历史流量统计。
 	//    服务器删除后这些全是孤儿,一并清掉。表名为内部常量,非用户输入,无注入风险。
 	//    注:证书(certificates.remote_server_id)按用户要求保留不动;dns_providers / custom_rules 为全局可复用资源,不在此列。
+	// 删除明细前先把本周期已结算的计费流量按用户结转。否则 user_email_traffic
+	// 被删除后，用户套餐已用量、限额判断和通知都会倒退。
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_traffic_cycle_carry(username,weighted_uplink,weighted_downlink)
+		SELECT attributed_username,
+		       SUM(CASE WHEN weighted_uplink > cycle_base_weighted_uplink THEN weighted_uplink-cycle_base_weighted_uplink ELSE 0 END),
+		       SUM(CASE WHEN weighted_downlink > cycle_base_weighted_downlink THEN weighted_downlink-cycle_base_weighted_downlink ELSE 0 END)
+		FROM user_email_traffic WHERE server_id = ? AND attributed_username != '' GROUP BY attributed_username
+		ON CONFLICT(username) DO UPDATE SET
+		weighted_uplink=user_traffic_cycle_carry.weighted_uplink+excluded.weighted_uplink,
+		weighted_downlink=user_traffic_cycle_carry.weighted_downlink+excluded.weighted_downlink,
+		updated_at=CURRENT_TIMESTAMP`, id); err != nil {
+		return fmt.Errorf("carry user traffic before deleting server: %w", err)
+	}
+	// 日历范围统计同样不能随服务器外键级联删除。归档表不保留 server_id，
+	// 因为服务器已不存在，但仍保留用户每天已经产生的事实流量。
+	if _, err := tx.ExecContext(ctx, `INSERT INTO traffic_daily_users_archived(username,date,uplink,downlink)
+		SELECT username,date,SUM(uplink),SUM(downlink) FROM traffic_daily_users WHERE server_id = ? GROUP BY username,date
+		ON CONFLICT(username,date) DO UPDATE SET
+		uplink=traffic_daily_users_archived.uplink+excluded.uplink,
+		downlink=traffic_daily_users_archived.downlink+excluded.downlink,
+		updated_at=CURRENT_TIMESTAMP`, id); err != nil {
+		return fmt.Errorf("archive daily user traffic before deleting server: %w", err)
+	}
 	for _, table := range []string{
 		// 活跃运营配置
 		"user_inbound_configs",
@@ -12465,6 +12519,8 @@ func (r *TrafficRepository) DeleteRemoteServer(ctx context.Context, id int64) er
 		"node_traffic_snapshots",
 		"user_traffic_snapshots",
 		"server_system_traffic_snapshots",
+		// 已在 traffic_daily_users_archived 按用户/日期结转。
+		"traffic_daily_users",
 	} {
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s WHERE server_id = ?`, table), id); err != nil {
 			return fmt.Errorf("delete %s: %w", table, err)
@@ -13103,6 +13159,9 @@ func (r *TrafficRepository) resetUserTrafficCycle(ctx context.Context, username 
 // 或日账本；读取本周期流量时只取该检查点之后的增量。
 // 套餐切换和手动/月度重置必须共用这一实现，避免三条路径口径漂移。
 func checkpointUserTrafficRowsTx(ctx context.Context, tx *dialectTx, username string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM user_traffic_cycle_carry WHERE username = ?`, username); err != nil {
+		return fmt.Errorf("reset carried user traffic cycle: %w", err)
+	}
 	const userStmt = `UPDATE user_traffic SET uplink = 0, downlink = 0, cycle_start = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE username = ?`
 	if _, err := tx.ExecContext(ctx, userStmt, username); err != nil {
 		return fmt.Errorf("reset user traffic cycle: %w", err)
