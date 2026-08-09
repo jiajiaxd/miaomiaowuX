@@ -46,6 +46,143 @@ func NewAdminXrayCredentialResetHandler(repo *storage.TrafficRepository, rm *Rem
 	})
 }
 
+// NewAdminNodeCredentialRepairHandler repairs subscription-facing credentials
+// in nodes from the administrator credential records already stored by the
+// master. It deliberately does not mutate Xray or generate new credentials.
+func NewAdminNodeCredentialRepairHandler(repo *storage.TrafficRepository) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, errors.New("only POST is supported"))
+			return
+		}
+		username := strings.TrimSpace(auth.UsernameFromContext(r.Context()))
+		admin, err := repo.GetUser(r.Context(), username)
+		if err != nil || admin.Role != storage.RoleAdmin {
+			writeError(w, http.StatusForbidden, errors.New("administrator account required"))
+			return
+		}
+
+		result, err := repairAdminNodeCredentials(r.Context(), repo, admin)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{
+			"status":            "repaired",
+			"nodes_repaired":    result.repaired,
+			"nodes_unchanged":   result.unchanged,
+			"records_unmatched": result.unmatched,
+		})
+	})
+}
+
+type adminNodeCredentialRepairResult struct {
+	repaired  int
+	unchanged int
+	unmatched int
+}
+
+func repairAdminNodeCredentials(ctx context.Context, repo *storage.TrafficRepository, admin storage.User) (adminNodeCredentialRepairResult, error) {
+	var result adminNodeCredentialRepairResult
+	nodes, err := repo.ListAllNodes(ctx)
+	if err != nil {
+		return result, fmt.Errorf("list nodes: %w", err)
+	}
+	servers, err := repo.ListRemoteServers(ctx)
+	if err != nil {
+		return result, fmt.Errorf("list servers: %w", err)
+	}
+	serverNames := make(map[int64]string, len(servers))
+	for _, server := range servers {
+		serverNames[server.ID] = server.Name
+	}
+
+	configs, err := repo.GetUserInboundConfigs(ctx, admin.Username)
+	if err != nil {
+		return result, fmt.Errorf("list administrator inbound credentials: %w", err)
+	}
+	for _, cfg := range configs {
+		credential := map[string]interface{}{}
+		if err := json.Unmarshal([]byte(cfg.CredentialJSON), &credential); err != nil {
+			return result, fmt.Errorf("decode credential for server %d inbound %s: %w", cfg.ServerID, cfg.InboundTag, err)
+		}
+		serverName := serverNames[cfg.ServerID]
+		if serverName == "" {
+			result.unmatched++
+			continue
+		}
+		matched := false
+		for _, node := range nodes {
+			// Early releases left username empty on some administrator-created
+			// physical nodes. They are still safe to repair because server+inbound
+			// is tied to this administrator credential record.
+			if node.NodeType == "routed" || (node.Username != "" && node.Username != admin.Username) ||
+				node.OriginalServer != serverName || node.InboundTag != cfg.InboundTag {
+				continue
+			}
+			matched = true
+			if !json.Valid([]byte(node.ClashConfig)) {
+				return result, fmt.Errorf("physical node %d has invalid clash config", node.ID)
+			}
+			repaired := cloneClashWithCredential(node.ClashConfig, cfg.Protocol, credential, node.NodeName)
+			if repaired == node.ClashConfig {
+				result.unchanged++
+				continue
+			}
+			if err := repo.UpdateNodeClashCredential(ctx, node.ID, repaired); err != nil {
+				return result, fmt.Errorf("repair physical node %d: %w", node.ID, err)
+			}
+			result.repaired++
+		}
+		if !matched {
+			result.unmatched++
+		}
+	}
+
+	subaccounts, err := repo.ListUserSubaccounts(ctx, admin.Username)
+	if err != nil {
+		return result, fmt.Errorf("list administrator routed subaccounts: %w", err)
+	}
+	for _, sa := range subaccounts {
+		routed, err := repo.GetRoutedNodeDetail(ctx, sa.RoutedNodeID)
+		if err != nil {
+			result.unmatched++
+			continue
+		}
+		// A routed node can retain more than one administrator-related record.
+		// Only its designated administrator email is allowed to overwrite the
+		// subscription-facing credential.
+		if routed.RoutedAdminEmail != "" && routed.RoutedAdminEmail != sa.Email {
+			result.unmatched++
+			continue
+		}
+		protocol := routed.Protocol
+		if routed.ParentNodeID != nil {
+			if parent, perr := repo.GetNodeByID(ctx, *routed.ParentNodeID); perr == nil && parent.Protocol != "" {
+				protocol = parent.Protocol
+			}
+		}
+		credential := map[string]interface{}{}
+		if err := json.Unmarshal([]byte(sa.CredentialJSON), &credential); err != nil {
+			return result, fmt.Errorf("decode routed credential %d: %w", sa.ID, err)
+		}
+		if !json.Valid([]byte(routed.ClashConfig)) {
+			return result, fmt.Errorf("routed node %d has invalid clash config", routed.ID)
+		}
+		repaired := cloneClashWithCredential(routed.ClashConfig, protocol, credential, routed.NodeName)
+		credentialChanged := strings.TrimSpace(routed.RoutedAdminCredential) != strings.TrimSpace(sa.CredentialJSON)
+		if repaired == routed.ClashConfig && !credentialChanged {
+			result.unchanged++
+			continue
+		}
+		if err := repo.UpdateRoutedAdminCredential(ctx, routed.ID, sa.CredentialJSON, repaired); err != nil {
+			return result, fmt.Errorf("repair routed node %d: %w", routed.ID, err)
+		}
+		result.repaired++
+	}
+	return result, nil
+}
+
 func resetAdminXrayCredentials(ctx context.Context, repo *storage.TrafficRepository, rm *RemoteManageHandler, admin storage.User) (int, error) {
 	configs, err := repo.GetUserInboundConfigs(ctx, admin.Username)
 	if err != nil {

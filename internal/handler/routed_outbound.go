@@ -1341,6 +1341,20 @@ func cloneClashWithCredential(parentClash, protocol string, newCred map[string]i
 		if pw, ok := newCred["password"].(string); ok && pw != "" {
 			pc["password"] = pw
 		}
+	case "socks", "http":
+		if user, ok := newCred["user"].(string); ok && user != "" {
+			pc["username"] = user
+		}
+		if pass, ok := newCred["pass"].(string); ok && pass != "" {
+			pc["password"] = pass
+		}
+	case "mieru":
+		if user, ok := newCred["username"].(string); ok && user != "" {
+			pc["username"] = user
+		}
+		if pass, ok := newCred["password"].(string); ok && pass != "" {
+			pc["password"] = pass
+		}
 	}
 	b, err := json.Marshal(pc)
 	if err != nil {
