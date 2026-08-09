@@ -163,6 +163,8 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.4.7-beta.4 (2026-08-09)
+- 🌈 偷自己的禁止开启reality防偷
 ### v0.4.7-beta.3 (2026-08-09)
 - 🌈 支持配置自定义主题名称
 - 🌈 reality支持防偷配置开关
