@@ -106,7 +106,7 @@ func (h *TunnelsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if p, _ := ib["protocol"].(string); p != "tunnel" {
 				continue
 			}
-			if tag == "tunnel-in" || tag == "api" {
+			if tag == "tunnel-in" || tag == "api" || isRealityGuardTag(tag) {
 				continue
 			}
 			ti := tunnelInfo{Kind: "inbound", ServerID: s.ID, ServerName: s.Name, IsFederated: isFed, Tag: tag}

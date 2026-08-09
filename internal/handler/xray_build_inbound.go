@@ -110,6 +110,9 @@ func buildInbound(req *buildInboundRequest) (map[string]any, map[string]any, err
 			return nil, nil, err
 		}
 		inbound["streamSettings"] = ss
+		if security == "reality" {
+			inbound["reality_guard"] = true
+		}
 		creds = merge(c, map[string]any{"uuid": uuid, "email": email, "flow": client["flow"]})
 
 	case "vmess":

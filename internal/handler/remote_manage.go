@@ -2593,6 +2593,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 	var inboundReq map[string]interface{}
 	var selectedWSSDomain string
 	var selectedWSSCertID int64
+	var realityGuardRequested *bool
 	if r.Method == http.MethodPost {
 		body, err = io.ReadAll(r.Body)
 		if err != nil {
@@ -2603,6 +2604,19 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		if err := json.Unmarshal(body, &inboundReq); err != nil {
 			remoteWriteError(w, http.StatusBadRequest, "invalid JSON body")
 			return
+		}
+	}
+
+	// reality_guard 是主控专用的带外开关，不能原样交给 Xray。辅助 tunnel 使用保留 tag，
+	// 在主入站成功写入后由完整配置同步函数一次性加入/更新/移除。
+	if r.Method == http.MethodPost && inboundReq != nil {
+		if inbound, _ := inboundReq["inbound"].(map[string]interface{}); inbound != nil {
+			if value, ok := inbound["reality_guard"].(bool); ok {
+				realityGuardRequested = new(bool)
+				*realityGuardRequested = value
+				delete(inbound, "reality_guard")
+				body, _ = json.Marshal(inboundReq)
+			}
 		}
 	}
 
@@ -2715,11 +2729,17 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 
 	// 删除 reality 入站前，先保存其 serverNames 以便后续恢复路由
 	var preDeleteRealityDomains []string
+	var preDeleteRealityGuard bool
+	var preDeleteInbound map[string]interface{}
 	if r.Method == http.MethodPost && inboundReq != nil {
 		action, _ := inboundReq["action"].(string)
 		if strings.ToLower(action) == "remove" {
 			if tag, _ := inboundReq["tag"].(string); tag != "" {
+				preDeleteInbound, _ = h.fetchRemoteInboundByTag(r.Context(), id, tag)
 				preDeleteRealityDomains = h.getRealityServerNames(r.Context(), id, tag)
+				if helper, _ := h.fetchRemoteInboundByTag(r.Context(), id, realityGuardTag(tag)); helper != nil {
+					preDeleteRealityGuard = true
+				}
 			}
 		}
 	}
@@ -2904,6 +2924,37 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		var resp map[string]interface{}
 		if err := json.Unmarshal(result, &resp); err == nil {
 			if success, ok := resp["success"].(bool); ok && success {
+				// Reality 防盗与主入站生命周期绑定。添加/修改按显式开关同步；删除始终清理专用辅助项。
+				guardTag := ""
+				guardEnable := false
+				guardSync := false
+				if actionLower == "remove" && preDeleteRealityGuard {
+					guardTag, _ = inboundReq["tag"].(string)
+					guardSync = strings.TrimSpace(guardTag) != ""
+				} else if (actionLower == "" || actionLower == "add") && realityGuardRequested != nil {
+					if inbound, _ := inboundReq["inbound"].(map[string]interface{}); inbound != nil && isRealityInbound(inbound) {
+						guardTag, _ = inbound["tag"].(string)
+						guardEnable = *realityGuardRequested
+						guardSync = strings.TrimSpace(guardTag) != ""
+					}
+				}
+				if guardSync {
+					if guardErr := h.syncRealityGuardConfig(r.Context(), id, guardTag, guardEnable); guardErr != nil {
+						// 新增/修改失败时恢复主入站；完整配置同步自身也会恢复辅助配置。
+						if isUpdate && updateOldInbound != nil {
+							rollbackBody, _ := json.Marshal(map[string]interface{}{"action": "replace", "tag": updateTag, "inbound": updateOldInbound})
+							_, _ = h.forwardToRemoteServer(context.Background(), id, http.MethodPost, "/api/child/inbounds", rollbackBody)
+						} else if actionLower == "remove" && preDeleteInbound != nil {
+							rollbackBody, _ := json.Marshal(map[string]interface{}{"action": "add", "inbound": preDeleteInbound})
+							_, _ = h.forwardToRemoteServer(context.Background(), id, http.MethodPost, "/api/child/inbounds", rollbackBody)
+						} else if actionLower == "" || actionLower == "add" {
+							rollbackBody, _ := json.Marshal(map[string]interface{}{"action": "remove", "tag": guardTag})
+							_, _ = h.forwardToRemoteServer(context.Background(), id, http.MethodPost, "/api/child/inbounds", rollbackBody)
+						}
+						remoteWriteError(w, http.StatusBadGateway, "Reality 防盗配置下发失败，已回滚: "+guardErr.Error())
+						return
+					}
+				}
 				if isUpdate {
 					if syncErr := h.repo.UpdateInboundCredentialReferences(r.Context(), id, updateTag, updatedProtocol, regeneratedCredentials); syncErr != nil {
 						rollbackBody, _ := json.Marshal(map[string]interface{}{"action": "replace", "tag": updateTag, "inbound": updateOldInbound})
@@ -3029,6 +3080,31 @@ func (h *RemoteManageHandler) filterInboundsResponse(result []byte) []byte {
 		return result
 	}
 
+	// 编辑 Reality 入站时把辅助 tunnel 隐藏成一个布尔开关，并将实际伪装目标还原到 dest。
+	// 否则界面会看到 127.0.0.1:本地端口，保存后也无法正确判断功能是否开启。
+	for _, ib := range resp.Inbounds {
+		tag := strings.TrimSpace(fmt.Sprint(ib["tag"]))
+		reality := realitySettingsOf(ib)
+		if tag == "" || reality == nil {
+			continue
+		}
+		ib["reality_guard"] = false
+		guardTag := realityGuardTag(tag)
+		for _, candidate := range resp.Inbounds {
+			if strings.TrimSpace(fmt.Sprint(candidate["tag"])) != guardTag {
+				continue
+			}
+			settings, _ := candidate["settings"].(map[string]interface{})
+			host := strings.TrimSpace(fmt.Sprint(settings["address"]))
+			port := toInt(settings["port"])
+			if host != "" && port > 0 {
+				reality["dest"] = joinRealityDest(host, port)
+				ib["reality_guard"] = true
+			}
+			break
+		}
+	}
+
 	// 过滤入站列表
 	filtered := make([]map[string]interface{}, 0, len(resp.Inbounds))
 	for _, ib := range resp.Inbounds {
@@ -3036,7 +3112,7 @@ func (h *RemoteManageHandler) filterInboundsResponse(result []byte) []byte {
 		source, _ := ib["_source"].(string)
 
 		// 跳过 tag="api" 的入站
-		if tag == "api" {
+		if tag == "api" || isRealityGuardTag(tag) {
 			continue
 		}
 		// 跳过空 tag 的 runtime_only 入站
