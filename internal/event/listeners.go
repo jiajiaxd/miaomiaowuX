@@ -509,27 +509,50 @@ func (l *NodeSyncListener) handleUpdated(ctx context.Context, event InboundEvent
 	// 下面基于 chooseClashServerHost 的 v4/v6 更新只对「非中转」节点生效。
 	if l.applyRelayNodesOnUpdate(ctx, server.Name, event, clashConfig) {
 		log.Printf("[NodeSync] Updated relay node(s) for inbound: %s/%s", server.Name, event.Tag)
-	} else {
-		// v4/域名节点:用 base 配置(server = chooseClashServerHost)更新。
-		if err := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, clashConfig, "v4"); err != nil {
-			log.Printf("[NodeSync] Failed to update v4 node: %v", err)
-		}
-
-		// IPv6 节点使用自己的地址更新，且存储层只更新物理节点，不再先污染 routed 子节点。
-		if v6Host := chooseClashServerHostV6(server); v6Host != "" {
-			var m map[string]any
-			if json.Unmarshal([]byte(clashConfig), &m) == nil {
-				name, _ := m["name"].(string)
-				if v6cfg, cerr := cloneClashWithServer(m, name, v6Host); cerr == nil {
-					if err := l.repo.UpdateNodeByInboundTag(ctx, server.Name, event.Tag, v6cfg, "v6"); err != nil {
-						log.Printf("[NodeSync] Failed to update v6 node: %v", err)
-					}
-				}
-			}
-		}
 	}
+	// Update physical nodes one by one so an omitted/blank node_name cannot
+	// replace a user's saved name with the converter's generated default. This
+	// also avoids one relay sibling preventing non-relay v4/v6 siblings from
+	// being refreshed.
+	l.updatePhysicalNodesPreservingNames(ctx, server, event.Tag, clashConfig)
 	l.refreshRoutedChildrenAfterInboundUpdate(ctx, server.Name, event.Tag)
 	log.Printf("[NodeSync] Updated node(s) for inbound: %s/%s", server.Name, event.Tag)
+}
+
+func (l *NodeSyncListener) updatePhysicalNodesPreservingNames(ctx context.Context, server *storage.RemoteServer, inboundTag, baseClash string) {
+	nodes, err := l.repo.ListAllNodes(ctx)
+	if err != nil {
+		log.Printf("[NodeSync] Failed to list nodes while preserving names: %v", err)
+		return
+	}
+	var base map[string]any
+	if err := json.Unmarshal([]byte(baseClash), &base); err != nil {
+		log.Printf("[NodeSync] Failed to parse updated clash config: %v", err)
+		return
+	}
+	for _, node := range nodes {
+		if node.NodeType == "routed" || node.OriginalServer != server.Name || node.InboundTag != inboundTag {
+			continue
+		}
+		if strings.TrimSpace(node.RelayOrigServer) != "" {
+			continue // applyRelayNodesOnUpdate already handled this node.
+		}
+		host, _ := base["server"].(string)
+		if strings.EqualFold(strings.TrimSpace(node.IPFamily), "v6") {
+			host = chooseClashServerHostV6(server)
+			if host == "" {
+				continue
+			}
+		}
+		cfg, err := cloneClashWithServer(base, node.NodeName, host)
+		if err != nil {
+			log.Printf("[NodeSync] Failed to preserve node %d name: %v", node.ID, err)
+			continue
+		}
+		if err := l.repo.UpdateNodeProxyConfigs(ctx, node.ID, cfg, cfg); err != nil {
+			log.Printf("[NodeSync] Failed to update physical node %d: %v", node.ID, err)
+		}
+	}
 }
 
 func (l *NodeSyncListener) refreshRoutedChildrenAfterInboundUpdate(ctx context.Context, serverName, inboundTag string) {

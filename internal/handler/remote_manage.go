@@ -2366,6 +2366,45 @@ func preserveInboundCredentials(newInbound, current map[string]any, protocol str
 	}
 }
 
+// inboundUpdateRequiresCredentialRegeneration reports whether an inbound edit
+// changes the credential contract. Ordinary transport edits (port, host/path,
+// Reality destination/keys, sniffing, sockopt and the Reality guard switch)
+// must keep every existing Xray client credential intact.
+//
+// A protocol/security/method transition is deliberately treated as a contract
+// change. Besides different credential shapes, VLESS security transitions may
+// change the required flow and SS2022 method transitions may change key length.
+func inboundUpdateRequiresCredentialRegeneration(next, current map[string]any) bool {
+	oldProtocol := strings.ToLower(strings.TrimSpace(fmt.Sprint(current["protocol"])))
+	newProtocol := strings.ToLower(strings.TrimSpace(fmt.Sprint(next["protocol"])))
+	if oldProtocol != newProtocol {
+		return true
+	}
+
+	streamSecurity := func(inbound map[string]any) string {
+		stream, _ := inbound["streamSettings"].(map[string]any)
+		security := strings.ToLower(strings.TrimSpace(fmt.Sprint(stream["security"])))
+		if security == "<nil>" || security == "none" {
+			return ""
+		}
+		return security
+	}
+	if streamSecurity(current) != streamSecurity(next) {
+		return true
+	}
+
+	if newProtocol == "shadowsocks" {
+		method := func(inbound map[string]any) string {
+			settings, _ := inbound["settings"].(map[string]any)
+			return strings.ToLower(strings.TrimSpace(fmt.Sprint(settings["method"])))
+		}
+		if method(current) != method(next) {
+			return true
+		}
+	}
+	return false
+}
+
 func regenerateInboundCredentials(inbound, current map[string]interface{}) (map[string]string, error) {
 	protocol := strings.ToLower(strings.TrimSpace(fmt.Sprint(inbound["protocol"])))
 	settings, _ := inbound["settings"].(map[string]interface{})
@@ -2662,56 +2701,67 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 		updateOldInbound = current
 		// TAG 是路由与节点关联的稳定主键；其它配置（含协议）均允许修改。
 		inbound["tag"] = tag
-		credentials, regenErr := regenerateInboundCredentials(inbound, current)
-		if regenErr != nil {
-			remoteWriteError(w, http.StatusBadRequest, "重新生成账户凭据失败: "+regenErr.Error())
-			return
+		regenerateCredentials := inboundUpdateRequiresCredentialRegeneration(inbound, current)
+		credentials := map[string]string(nil)
+		if regenerateCredentials {
+			var regenErr error
+			credentials, regenErr = regenerateInboundCredentials(inbound, current)
+			if regenErr != nil {
+				remoteWriteError(w, http.StatusBadRequest, "重新生成账户凭据失败: "+regenErr.Error())
+				return
+			}
+		} else {
+			// Do not trust credentials submitted by the browser. Copy the live
+			// Agent values back into the replacement inbound byte-for-byte.
+			preserveInboundCredentials(inbound, current, strings.ToLower(strings.TrimSpace(fmt.Sprint(current["protocol"]))))
 		}
 		protocol := strings.ToLower(strings.TrimSpace(fmt.Sprint(inbound["protocol"])))
 		settings, _ := inbound["settings"].(map[string]interface{})
 		method := strings.TrimSpace(fmt.Sprint(settings["method"]))
 		// Agent 上只有当前活跃账户；数据库还可能保存禁用/超限用户的凭据。
 		// 这些账户也预生成新协议凭据，但不塞回 Agent，恢复权限时直接复用新值。
-		if configs, err := h.repo.GetUserInboundConfigsByServer(r.Context(), id); err == nil {
-			for _, cfg := range configs {
-				if cfg.InboundTag != tag {
-					continue
-				}
-				var old map[string]interface{}
-				_ = json.Unmarshal([]byte(cfg.CredentialJSON), &old)
-				identity := strings.TrimSpace(fmt.Sprint(old["email"]))
-				if identity == "" || identity == "<nil>" {
-					identity = strings.TrimSpace(fmt.Sprint(old["user"]))
-				}
-				if identity == "" || identity == "<nil>" || credentials[identity] != "" {
-					continue
-				}
-				cred, credJSON, err := generateRoutedClientCred(protocol, method, identity)
-				if err != nil {
-					remoteWriteError(w, http.StatusBadRequest, "生成非活跃账户凭据失败: "+err.Error())
-					return
-				}
-				if inboundCredentialKey(protocol) == "accounts" {
-					cred["user"] = identity
-					delete(cred, "email")
-					if b, err := json.Marshal(cred); err == nil {
-						credJSON = string(b)
+		if regenerateCredentials {
+			if configs, err := h.repo.GetUserInboundConfigsByServer(r.Context(), id); err == nil {
+				for _, cfg := range configs {
+					if cfg.InboundTag != tag {
+						continue
 					}
+					var old map[string]interface{}
+					_ = json.Unmarshal([]byte(cfg.CredentialJSON), &old)
+					identity := strings.TrimSpace(fmt.Sprint(old["email"]))
+					if identity == "" || identity == "<nil>" {
+						identity = strings.TrimSpace(fmt.Sprint(old["user"]))
+					}
+					if identity == "" || identity == "<nil>" || credentials[identity] != "" {
+						continue
+					}
+					cred, credJSON, err := generateRoutedClientCred(protocol, method, identity)
+					if err != nil {
+						remoteWriteError(w, http.StatusBadRequest, "生成非活跃账户凭据失败: "+err.Error())
+						return
+					}
+					if inboundCredentialKey(protocol) == "accounts" {
+						cred["user"] = identity
+						delete(cred, "email")
+						if b, err := json.Marshal(cred); err == nil {
+							credJSON = string(b)
+						}
+					}
+					credentials[identity] = credJSON
 				}
-				credentials[identity] = credJSON
 			}
-		}
-		if emails, err := h.repo.ListInboundSubaccountEmails(r.Context(), id, tag); err == nil {
-			for _, email := range emails {
-				if credentials[email] != "" {
-					continue
+			if emails, err := h.repo.ListInboundSubaccountEmails(r.Context(), id, tag); err == nil {
+				for _, email := range emails {
+					if credentials[email] != "" {
+						continue
+					}
+					_, credJSON, err := generateRoutedClientCred(protocol, method, email)
+					if err != nil {
+						remoteWriteError(w, http.StatusBadRequest, "生成路由子账户凭据失败: "+err.Error())
+						return
+					}
+					credentials[email] = credJSON
 				}
-				_, credJSON, err := generateRoutedClientCred(protocol, method, email)
-				if err != nil {
-					remoteWriteError(w, http.StatusBadRequest, "生成路由子账户凭据失败: "+err.Error())
-					return
-				}
-				credentials[email] = credJSON
 			}
 		}
 		inboundReq["regenerated_credentials"] = credentials
@@ -2968,7 +3018,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 						return
 					}
 				}
-				if isUpdate {
+				if isUpdate && regeneratedCredentials != nil {
 					if syncErr := h.repo.UpdateInboundCredentialReferences(r.Context(), id, updateTag, updatedProtocol, regeneratedCredentials); syncErr != nil {
 						rollbackBody, _ := json.Marshal(map[string]interface{}{"action": "replace", "tag": updateTag, "inbound": updateOldInbound})
 						if _, rollbackErr := h.forwardToRemoteServer(context.Background(), id, http.MethodPost, "/api/child/inbounds", rollbackBody); rollbackErr != nil {
@@ -3037,7 +3087,7 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 						if isUpdate {
 							evtType = event.EventInboundUpdated
 						}
-						event.GetBus().PublishAsync(event.InboundEvent{
+						inboundEvent := event.InboundEvent{
 							Type:          evtType,
 							ServerID:      id,
 							Tag:           tag,
@@ -3050,7 +3100,14 @@ func (h *RemoteManageHandler) HandleInbounds(w http.ResponseWriter, r *http.Requ
 							RelayServer:   relayServer,
 							RelayPort:     relayPort,
 							Insecure:      inboundInsecure,
-						})
+						}
+						if isUpdate {
+							// 更新必须在返回成功前把节点表和路由子节点同步完，避免
+							// Agent 已使用新配置而订阅仍短暂/永久保留旧配置。
+							event.GetBus().Publish(inboundEvent)
+						} else {
+							event.GetBus().PublishAsync(inboundEvent)
+						}
 					}
 				} else if actionLower == "remove" {
 					// 删除入站：发布事件
