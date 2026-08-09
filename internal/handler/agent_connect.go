@@ -730,8 +730,12 @@ name="mmw-agent"
 description="MMW Agent Remote Server"
 command="/usr/local/bin/mmw-agent"
 command_args="-c /etc/mmw-agent/config.yaml"
-command_background="yes"
-pidfile="/run/mmw-agent.pid"
+# supervise-daemon keeps the agent alive when it intentionally exits after a
+# listen_port / xray_mode switch. command_background/start-stop-daemon alone
+# only daemonizes once and does not respawn the process.
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
 # 日志由 agent 自身写文件并轮转(/var/log/mmw-agent/mmw-agent.log),不再用 output_log 重复落地(避免无轮转爆盘)
 depend() { need net; }
 EOF
