@@ -2651,12 +2651,13 @@ func NewNodeURIsHandler(repo *storage.TrafficRepository) http.Handler {
 			return
 		}
 		type uriItem struct {
-			Username string `json:"username"`
-			NodeID   int64  `json:"node_id"`
-			NodeName string `json:"node_name"`
-			Protocol string `json:"protocol"`
-			NodeType string `json:"node_type"`
-			URI      string `json:"uri"`
+			Username   string `json:"username"`
+			NodeID     int64  `json:"node_id"`
+			NodeName   string `json:"node_name"`
+			ServerName string `json:"server_name"`
+			Protocol   string `json:"protocol"`
+			NodeType   string `json:"node_type"`
+			URI        string `json:"uri"`
 		}
 		prod := substore.NewURIProducer()
 		items := make([]uriItem, 0)
@@ -2680,12 +2681,13 @@ func NewNodeURIsHandler(repo *storage.TrafficRepository) http.Handler {
 					continue
 				}
 				items = append(items, uriItem{
-					Username: u.Username,
-					NodeID:   n.ID,
-					NodeName: n.NodeName,
-					Protocol: n.Protocol,
-					NodeType: n.NodeType,
-					URI:      uri,
+					Username:   u.Username,
+					NodeID:     n.ID,
+					NodeName:   n.NodeName,
+					ServerName: n.OriginalServer,
+					Protocol:   n.Protocol,
+					NodeType:   n.NodeType,
+					URI:        uri,
 				})
 			}
 		}
