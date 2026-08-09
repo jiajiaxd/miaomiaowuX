@@ -84,11 +84,16 @@ func redactURLError(err error) error {
 	return err
 }
 
-// markdownEscaper 转义 Telegram legacy Markdown 的特殊字符。
-var markdownEscaper = strings.NewReplacer("_", "\\_", "*", "\\*", "`", "\\`", "[", "\\[")
+// markdownEscaper 转义 Telegram legacy Markdown 中会独立改变样式的字符。
+// 普通成对方括号(如节点名 [GOMAMI])不是链接，不应转义：部分第三方客户端会把
+// `\[` 的反斜杠原样显示。真正形如 [text](url) 的动态内容在函数中单独防护。
+var markdownEscaper = strings.NewReplacer("_", "\\_", "*", "\\*", "`", "\\`")
 
 // EscapeMarkdown 把用户名/服务器名等动态内容安全地嵌进带 *bold* / `code` 的消息模板。
-// 未转义时,含下划线(或 * ` [)的用户名会让 TG 的 Markdown 解析失败 → 400 bad request。
+// 未转义时,含下划线(或 * `)的用户名会让 TG 的 Markdown 解析失败 → 400 bad request。
 func EscapeMarkdown(s string) string {
+	if strings.Contains(s, "](") {
+		s = strings.ReplaceAll(s, "[", "\\[")
+	}
 	return markdownEscaper.Replace(s)
 }
