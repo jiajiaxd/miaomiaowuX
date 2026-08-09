@@ -127,6 +127,62 @@ chmod +x mmwx-linux-amd64
 └────────┘  └────────┘  └────────┘
 ```
 
+## 探针 API
+
+探针提供当前状态、WebSocket 实时推送和 24 小时历史序列接口。响应采用字段白名单，不包含服务器 ID、IP、Token、Agent 地址或 Xray 配置。
+
+| 接口 | 说明 |
+|------|------|
+| `GET /api/public/probe-servers` | 服务器状态、系统指标、周期流量、延迟及回程信息 |
+| `WS /api/public/probe-ws` | 每 5 秒推送与 `probe-servers` 相同的数据结构 |
+| `GET /api/public/probe-series` | 查询 `1h`、`6h` 或 `24h` 延迟和系统指标历史 |
+
+独立探针开启接口保护后，需要发送 `X-MMwx-Probe-Token` 请求头。字段单位、可选开关、历史查询参数及完整响应结构请参阅[探针 API 字段说明](https://miaomiaowux.com/docs/probe-api)。
+
+<details>
+<summary>展开查看完整字段速查</summary>
+
+顶层字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `enabled` | boolean | 探针是否启用；关闭时仅保证包含此字段 |
+| `title` / `logo` | string | 自定义标题及 Logo URL 或 `data:` URI |
+| `appearance` | object | `theme`、`color_mode`、`revision` |
+| `block_login` | boolean | 是否禁止访问原登录页 |
+| `show_name` / `show_globe` | boolean | 名称与 3D 地球展示开关 |
+| `license_badge` | object | 可选许可证 `name`、`display_name` |
+| `servers` | array | 展示服务器列表 |
+
+`servers[]` 字段：
+
+| 字段 | 单位/类型 | 说明 |
+|------|-----------|------|
+| `name` / `online` | string / boolean | 服务器名称与在线状态 |
+| `region` / `region_country` / `region_name` / `region_city` | string | 地区 Emoji、国家、完整地域与城市 |
+| `provider_name` / `provider_url` / `telecom_paid_peer` | string / boolean | 服务商信息与 163 Paid Peer 标记 |
+| `upload_speed` / `download_speed` | B/s | 当前上下行网速 |
+| `traffic_used` / `traffic_limit` | byte | 当前重置周期用量及限额 |
+| `cumulative_up` / `cumulative_down` | byte | 系统网卡当前周期累计上下行 |
+| `daily_traffic` | array | `{date, uplink, downlink, total}` 每日流量 |
+| `cpu_pct` / `loadavg` | % / string | CPU 使用率与负载 |
+| `mem_used` / `mem_total` | byte | 内存使用量及总量 |
+| `disk_used` / `disk_total` | byte | 磁盘使用量及总量 |
+| `uptime` | second | 系统在线时长 |
+| `cpu_model` / `cpu_cores` / `cpu_threads` | string / integer | CPU 信息 |
+| `os` / `kernel` / `arch` | string | 系统、内核与架构 |
+| `ping` | array | `{key,label,isp,current_ms,loss_pct,buckets}`；`-1` 表示无数据或失败 |
+| `expires_at` | `YYYY-MM-DD` | 到期日期 |
+| `renewal_price` / `renewal_currency` / `renewal_cycle` | number / string | 原币价格、币种及月/季/半年/年周期 |
+| `renewal_price_cny` | number | 按许可证汇率换算的人民币价格 |
+| `return_routes` | array | `{carrier,region,route_type,tested_at}` 三网回程 |
+
+历史接口参数：`server` 是 `servers` 数组下标；`metric` 为 `ping` 或 `system`；`range` 支持 `1h`、`6h`、`24h`；`target` 指定延迟目标；`all=1` 返回全部目标。响应包含 `success`、`bucket_sec`、`generated_at`、`series`，系统序列包含 CPU、内存、网速及累计上下行，每个点为 `{t, value}`。
+
+关闭采集开关、Agent 不支持或暂时无数据时，可选字段会被省略，而不是固定返回 `0`。
+
+</details>
+
 ## 配置文件
 
 ```yaml
