@@ -222,6 +222,8 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.4.7-beta.7 (2026-08-10)
+- 🌈 支持套餐单独设置节点流量
 ### v0.4.7-beta.6 (2026-08-10)
 - 🛠️ fix: 偶发前后端交互解密失败
 - 🛠️ fix: 保存套餐节点报错
