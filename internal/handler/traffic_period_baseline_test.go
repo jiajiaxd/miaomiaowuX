@@ -24,6 +24,24 @@ func TestSubEmailBaselineFallsBackAsOneCycle(t *testing.T) {
 	}
 }
 
+func TestRoutedConnectionStatsUseSubaccountNodeID(t *testing.T) {
+	refs := map[int64]storage.InboundNodeRef{
+		101: {InboundTag: "shared-in", NodeID: 101, ParentID: 10, NodeType: "routed"},
+		102: {InboundTag: "shared-in", NodeID: 102, ParentID: 10, NodeType: "routed"},
+	}
+	a := routedRefForSubaccount(storage.ActiveSubaccountForLimiter{RoutedNodeID: 101, InboundTag: "shared-in"}, refs)
+	b := routedRefForSubaccount(storage.ActiveSubaccountForLimiter{RoutedNodeID: 102, InboundTag: "shared-in"}, refs)
+	if a.NodeID != 101 || b.NodeID != 102 {
+		t.Fatalf("routed nodes sharing an inbound were merged: a=%+v b=%+v", a, b)
+	}
+	if connGroupKey("alice", a.ParentID) != connGroupKey("alice", b.ParentID) {
+		t.Fatal("routed nodes on the same physical inbound must still share the quota group")
+	}
+	if connGroupKey("alice", a.NodeID) == connGroupKey("alice", b.NodeID) {
+		t.Fatal("routed nodes must have distinct statistics groups")
+	}
+}
+
 func TestDailyLedgerHistoryKeepsInstallationFirstDay(t *testing.T) {
 	const gb = int64(1 << 30)
 	rows := []storage.ServerDailyTraffic{

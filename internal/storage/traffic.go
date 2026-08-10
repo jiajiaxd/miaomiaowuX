@@ -9981,15 +9981,16 @@ func (r *TrafficRepository) ListSubaccountsByRoutedNode(ctx context.Context, rou
 // （含 inactive）。调用方用 IsActive 决定是否加入用户，同时仍可为只剩 inactive
 // 子账号的 inbound 下发空列表，清除 Agent 内存里的旧 limiter 配置和存量连接。
 type ActiveSubaccountForLimiter struct {
-	Username   string
-	Email      string
-	InboundTag string
-	IsActive   bool
+	Username     string
+	Email        string
+	RoutedNodeID int64
+	InboundTag   string
+	IsActive     bool
 }
 
 func (r *TrafficRepository) ListActiveSubaccountsByServerName(ctx context.Context, serverName string) ([]ActiveSubaccountForLimiter, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT sa.username, sa.email, COALESCE(n.inbound_tag, ''), sa.is_active
+		SELECT sa.username, sa.email, sa.routed_node_id, COALESCE(n.inbound_tag, ''), sa.is_active
 		FROM user_subaccounts sa
 		INNER JOIN nodes n ON sa.routed_node_id = n.id
 		WHERE n.original_server = ? AND n.node_type = 'routed'
@@ -10002,7 +10003,7 @@ func (r *TrafficRepository) ListActiveSubaccountsByServerName(ctx context.Contex
 	for rows.Next() {
 		var a ActiveSubaccountForLimiter
 		var active int
-		if err := rows.Scan(&a.Username, &a.Email, &a.InboundTag, &active); err != nil {
+		if err := rows.Scan(&a.Username, &a.Email, &a.RoutedNodeID, &a.InboundTag, &active); err != nil {
 			return nil, err
 		}
 		a.IsActive = active == 1

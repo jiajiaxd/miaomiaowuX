@@ -53,6 +53,16 @@ func connGroupKey(username string, physicalNodeID int64) string {
 	return fmt.Sprintf("%s|%d", username, physicalNodeID)
 }
 
+func routedRefForSubaccount(sa storage.ActiveSubaccountForLimiter, byID map[int64]storage.InboundNodeRef) storage.InboundNodeRef {
+	ref := byID[sa.RoutedNodeID]
+	if ref.NodeID == 0 {
+		// Keep statistics isolated even for temporarily inconsistent historical
+		// data. Falling back by inbound tag is unsafe because routed nodes share it.
+		ref.NodeID = sa.RoutedNodeID
+	}
+	return ref
+}
+
 func resolveLimit(user *storage.User, pkg *storage.Package, nodeID, parentID int64) (speedMbps float64, deviceLimit int) {
 	// 限速
 	switch {
@@ -148,15 +158,16 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		return nil, nil
 	}
 
-	// 预加载 inbound_tag → node(主账号走 physical,routed 子账号走 routed)
-	// 同 tag 上可能同时有 physical + routed,所以用两张 map 分流。
+	// 主账号可按 inbound_tag 唯一反查物理节点；路由子账号必须按
+	// user_subaccounts.routed_node_id 精确反查。同一物理入站下可以有多个 routed
+	// 节点共享 inbound_tag，若用 tag 做单值 map，所有连接会错误归到最后一个节点。
 	physicalByTag := make(map[string]storage.InboundNodeRef)
-	routedByTag := make(map[string]storage.InboundNodeRef)
+	routedByID := make(map[int64]storage.InboundNodeRef)
 	if serverName != "" {
 		if refs, err := p.repo.ListInboundNodeRefsForServer(ctx, serverName); err == nil {
 			for _, r := range refs {
 				if r.NodeType == "routed" {
-					routedByTag[r.InboundTag] = r
+					routedByID[r.NodeID] = r
 				} else {
 					physicalByTag[r.InboundTag] = r
 				}
@@ -261,7 +272,7 @@ func (p *LimiterConfigPusher) BuildLimiterConfigForServer(ctx context.Context, s
 		if user.PackageID > 0 {
 			pkg = pkgCache[user.PackageID]
 		}
-		ref := routedByTag[sa.InboundTag]
+		ref := routedRefForSubaccount(sa, routedByID)
 		speedMbps, deviceLimit := resolveLimit(user, pkg, ref.NodeID, ref.ParentID)
 		var speedBytes uint64
 		if speedMbps > 0 {
