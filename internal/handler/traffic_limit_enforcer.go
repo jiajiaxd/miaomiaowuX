@@ -2,9 +2,13 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -326,9 +330,194 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) (string, error) {
 	if serverResetErr != nil {
 		runErrors = append(runErrors, serverResetErr)
 	}
+	nodeChecked, nodeErr := e.CheckNodeTrafficLimits(ctx, now)
+	if nodeErr != nil {
+		runErrors = append(runErrors, nodeErr)
+	}
 
-	summary := fmt.Sprintf("users_reset=%d servers_reset=%d", userResetCount, serverResetCount)
+	summary := fmt.Sprintf("users_reset=%d servers_reset=%d nodes_checked=%d", userResetCount, serverResetCount, nodeChecked)
 	return summary, errors.Join(runErrors...)
+}
+
+// CheckNodeTrafficLimits enforces a quota shared by every account using a node.
+// Remote changes are retried until complete; the exhausted flag is only cleared
+// after every account recorded in node_traffic_suspensions has been restored.
+func (e *TrafficLimitEnforcer) CheckNodeTrafficLimits(ctx context.Context, now time.Time) (int, error) {
+	nodes, err := e.repo.ListTrafficLimitedNodes(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var errs []error
+	for _, node := range nodes {
+		if node.TrafficLimitBytes > 0 && node.TrafficResetDay > 0 && shouldResetThisMonth(now, true, node.TrafficResetDay, node.LastTrafficResetAt) {
+			if err := e.repo.ResetNodeTrafficCycle(ctx, node, now); err != nil {
+				errs = append(errs, fmt.Errorf("reset node %d: %w", node.ID, err))
+				continue
+			}
+			if refreshed, refreshErr := e.repo.GetNodeByID(ctx, node.ID); refreshErr == nil {
+				node = refreshed
+			}
+		}
+		used, err := e.repo.GetNodeTrafficUsed(ctx, node)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("read node %d traffic: %w", node.ID, err))
+			continue
+		}
+		over := node.TrafficLimitBytes > 0 && used >= node.TrafficLimitBytes
+		if over {
+			if err := e.suspendNodeTrafficAccess(ctx, node); err != nil {
+				errs = append(errs, fmt.Errorf("suspend node %d: %w", node.ID, err))
+				continue
+			}
+			if !node.TrafficExhausted {
+				_ = e.repo.SetNodeTrafficExhausted(ctx, node.ID, true)
+			}
+		} else if node.TrafficExhausted {
+			if err := e.restoreNodeTrafficAccess(ctx, node); err != nil {
+				errs = append(errs, fmt.Errorf("restore node %d: %w", node.ID, err))
+				continue
+			}
+			_ = e.repo.SetNodeTrafficExhausted(ctx, node.ID, false)
+		}
+	}
+	return len(nodes), errors.Join(errs...)
+}
+
+func (e *TrafficLimitEnforcer) suspendNodeTrafficAccess(ctx context.Context, node storage.Node) error {
+	if node.NodeType == "routed" {
+		subs, err := e.repo.ListSubaccountsByRoutedNode(ctx, node.ID)
+		if err != nil {
+			return err
+		}
+		var errs []error
+		for _, sa := range subs {
+			if !sa.IsActive {
+				continue
+			}
+			if err := removeUserFromRoutedNode(ctx, e.remoteManage, e.repo, sa.Username, node.ID); err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", sa.Username, err))
+				continue
+			}
+			_ = e.repo.SaveNodeTrafficSuspension(ctx, node.ID, sa.Username, "routed", "")
+		}
+		return errors.Join(errs...)
+	}
+	server, err := e.repo.GetRemoteServerByName(ctx, node.OriginalServer)
+	if err != nil || server == nil {
+		return fmt.Errorf("server %s not found", node.OriginalServer)
+	}
+	raw, err := e.remoteManage.forwardToRemoteServer(ctx, server.ID, "GET", "/api/child/inbounds", nil)
+	if err != nil {
+		return err
+	}
+	var response struct {
+		Success  bool                     `json:"success"`
+		Inbounds []map[string]interface{} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil || !response.Success {
+		return fmt.Errorf("parse inbounds response: %v", err)
+	}
+	known, _ := e.repo.ListNodeTrafficSuspensions(ctx, node.ID)
+	already := make(map[string]bool, len(known))
+	for _, s := range known {
+		already[s.Username+"|"+s.Kind] = true
+	}
+	var errs []error
+	var target map[string]interface{}
+	for _, inbound := range response.Inbounds {
+		if fmt.Sprint(inbound["tag"]) == node.InboundTag {
+			target = inbound
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("inbound %s not found", node.InboundTag)
+	}
+	settings, _ := target["settings"].(map[string]interface{})
+	for _, key := range []string{"clients", "users", "accounts"} {
+		items, _ := settings[key].([]interface{})
+		for _, item := range items {
+			credential, _ := item.(map[string]interface{})
+			if credential == nil {
+				continue
+			}
+			credentialJSON, _ := json.Marshal(credential)
+			identity := nodeTrafficCredentialIdentity(credential, credentialJSON)
+			if already[identity+"|physical"] {
+				continue
+			}
+			if err := e.repo.SaveNodeTrafficSuspension(ctx, node.ID, identity, "physical", string(credentialJSON)); err != nil {
+				errs = append(errs, fmt.Errorf("save %s suspension: %w", identity, err))
+				continue
+			}
+			if err := mutateInboundClient(ctx, e.remoteManage, server.ID, node.InboundTag, "remove-client", credential); err != nil && !isInboundNotFoundErr(err) {
+				_ = e.repo.DeleteNodeTrafficSuspension(ctx, node.ID, identity, "physical")
+				errs = append(errs, fmt.Errorf("%s: %w", identity, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func nodeTrafficCredentialIdentity(credential map[string]interface{}, raw []byte) string {
+	for _, key := range []string{"email", "user", "username", "clientId"} {
+		if value := strings.TrimSpace(fmt.Sprint(credential[key])); value != "" && value != "<nil>" {
+			return value
+		}
+	}
+	sum := sha256.Sum256(raw)
+	return "credential-" + hex.EncodeToString(sum[:8])
+}
+
+func (e *TrafficLimitEnforcer) restoreNodeTrafficAccess(ctx context.Context, node storage.Node) error {
+	suspended, err := e.repo.ListNodeTrafficSuspensions(ctx, node.ID)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, s := range suspended {
+		if s.Kind == "routed" {
+			user, err := e.repo.GetUser(ctx, s.Username)
+			if err != nil || !user.IsActive {
+				_ = e.repo.DeleteNodeTrafficSuspension(ctx, node.ID, s.Username, s.Kind)
+				continue
+			}
+			if over, _ := e.repo.IsUserOverLimit(ctx, s.Username); over {
+				continue
+			}
+			if err := addUserToRoutedNode(ctx, e.remoteManage, e.repo, user, node.ID); err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", s.Username, err))
+				continue
+			}
+		} else {
+			if username := e.repo.ResolveUsernameByEmail(ctx, s.Username); username != "" {
+				user, userErr := e.repo.GetUser(ctx, username)
+				if userErr == nil && !user.IsActive {
+					_ = e.repo.DeleteNodeTrafficSuspension(ctx, node.ID, s.Username, s.Kind)
+					continue
+				}
+				if over, _ := e.repo.IsUserOverLimit(ctx, username); over {
+					continue
+				}
+			}
+			server, serr := e.repo.GetRemoteServerByName(ctx, node.OriginalServer)
+			if serr != nil || server == nil {
+				errs = append(errs, fmt.Errorf("server %s not found", node.OriginalServer))
+				continue
+			}
+			var credential map[string]interface{}
+			if json.Unmarshal([]byte(s.CredentialJSON), &credential) != nil || credential == nil {
+				_ = e.repo.DeleteNodeTrafficSuspension(ctx, node.ID, s.Username, s.Kind)
+				continue
+			}
+			if err := mutateInboundClient(ctx, e.remoteManage, server.ID, node.InboundTag, "add-client", credential); err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", s.Username, err))
+				continue
+			}
+		}
+		_ = e.repo.DeleteNodeTrafficSuspension(ctx, node.ID, s.Username, s.Kind)
+	}
+	return errors.Join(errs...)
 }
 
 // CheckServerTrafficResets 是常规扫描与独立兜底任务共用的服务器重置入口。

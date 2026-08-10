@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"slices"
 	"time"
 
 	"miaomiaowux/internal/storage"
@@ -228,6 +229,9 @@ func (c *InboundClientReconciler) runOnce(ctx context.Context) (string, error) {
 		log.Printf("[InboundClientReconciler] list user inbound configs failed: %v", err)
 		return "", err
 	}
+	configs = slices.DeleteFunc(configs, func(cfg storage.UserInboundConfig) bool {
+		return c.repo.HasPhysicalNodeTrafficSuspension(ctx, cfg.Username, cfg.ServerID, cfg.InboundTag)
+	})
 
 	servers, err := c.repo.ListRemoteServers(ctx)
 	if err != nil {

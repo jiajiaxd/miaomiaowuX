@@ -538,9 +538,15 @@ type Node struct {
 	// IPFamily 节点的 IP 版本归属:""/"v4"(v4/域名/通用) | "v6"(IPv6 节点)。取代旧的"靠 clash server
 	// 是否含冒号"判定 —— v6 节点改用 v6 域名后 server 不再含冒号,冒号判定会失效。IP 漂移刷新、
 	// 编辑入站按 family 更新都以此列为准。空值按 v4 处理(向后兼容 / 迁移回填)。
-	IPFamily  string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	IPFamily string
+	// 节点共享流量额度。所有用户共用同一份额度；0 表示不限。
+	TrafficLimitBytes  int64
+	TrafficUsedOffset  int64
+	TrafficResetDay    int
+	TrafficExhausted   bool
+	LastTrafficResetAt *time.Time
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // RoutedNodeDetail 路由出站节点的完整元数据,通过专用 GetRoutedNodeDetail 读取。
@@ -1683,6 +1689,32 @@ CREATE INDEX IF NOT EXISTS idx_nodes_enabled ON nodes(enabled);
 	if err := r.ensureNodeColumn("ip_family", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
+	if err := r.ensureNodeColumn("traffic_limit_bytes", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureNodeColumn("traffic_used_offset", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureNodeColumn("traffic_reset_day", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureNodeColumn("traffic_exhausted", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := r.ensureNodeColumn("last_traffic_reset_at", "TIMESTAMP"); err != nil {
+		return err
+	}
+	if _, err := r.db.Exec(`CREATE TABLE IF NOT EXISTS node_traffic_suspensions (
+		node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+		username TEXT NOT NULL,
+		kind TEXT NOT NULL CHECK(kind IN ('physical','routed')),
+		credential_json TEXT NOT NULL DEFAULT '',
+		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY(node_id,username,kind)
+	)`); err != nil {
+		return fmt.Errorf("migrate node traffic suspensions: %w", err)
+	}
+	_, _ = r.db.Exec(`ALTER TABLE node_traffic_suspensions ADD COLUMN credential_json TEXT NOT NULL DEFAULT ''`)
 	if _, err := r.db.Exec(`UPDATE nodes SET ip_family = 'v6'
 		WHERE IFNULL(ip_family, '') = ''
 		  AND clash_config IS NOT NULL AND json_valid(clash_config) = 1

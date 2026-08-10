@@ -185,7 +185,7 @@ func (r *TrafficRepository) ListNodes(ctx context.Context, username string) ([]N
 		return nil, errors.New("username is required")
 	}
 
-	rows, err := r.db.QueryContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(relay_group_name, ''), COALESCE(relay_group_node_ids, '[]'), COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes WHERE username = ? ORDER BY created_at DESC`, username)
+	rows, err := r.db.QueryContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(relay_group_name, ''), COALESCE(relay_group_node_ids, '[]'), COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), COALESCE(traffic_limit_bytes,0), COALESCE(traffic_used_offset,0), COALESCE(traffic_reset_day,0), COALESCE(traffic_exhausted,0), last_traffic_reset_at, created_at, updated_at FROM nodes WHERE username = ? ORDER BY created_at DESC`, username)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
@@ -197,10 +197,12 @@ func (r *TrafficRepository) ListNodes(ctx context.Context, username string) ([]N
 		var enabled int
 		var tagsJSON string
 		var relayGroupIDsJSON string
-		if err := rows.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.RelayGroupName, &relayGroupIDsJSON, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
+		var exhausted int
+		if err := rows.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.RelayGroupName, &relayGroupIDsJSON, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.TrafficLimitBytes, &node.TrafficUsedOffset, &node.TrafficResetDay, &exhausted, &node.LastTrafficResetAt, &node.CreatedAt, &node.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan node: %w", err)
 		}
 		node.Enabled = enabled != 0
+		node.TrafficExhausted = exhausted != 0
 		scanNodeTags(&node, tagsJSON)
 		scanRelayGroupNodeIDs(&node, relayGroupIDsJSON)
 		nodes = append(nodes, node)
@@ -394,7 +396,7 @@ func (r *TrafficRepository) ListAllNodes(ctx context.Context) ([]Node, error) {
 		return nil, errors.New("traffic repository not initialized")
 	}
 
-	rows, err := r.db.QueryContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(relay_group_name, ''), COALESCE(relay_group_node_ids, '[]'), COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes ORDER BY created_at DESC`)
+	rows, err := r.db.QueryContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(relay_group_name, ''), COALESCE(relay_group_node_ids, '[]'), COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), COALESCE(traffic_limit_bytes,0), COALESCE(traffic_used_offset,0), COALESCE(traffic_reset_day,0), COALESCE(traffic_exhausted,0), last_traffic_reset_at, created_at, updated_at FROM nodes ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list all nodes: %w", err)
 	}
@@ -406,10 +408,12 @@ func (r *TrafficRepository) ListAllNodes(ctx context.Context) ([]Node, error) {
 		var enabled int
 		var tagsJSON string
 		var relayGroupIDsJSON string
-		if err := rows.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.RelayGroupName, &relayGroupIDsJSON, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
+		var exhausted int
+		if err := rows.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.RelayGroupName, &relayGroupIDsJSON, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.TrafficLimitBytes, &node.TrafficUsedOffset, &node.TrafficResetDay, &exhausted, &node.LastTrafficResetAt, &node.CreatedAt, &node.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan node: %w", err)
 		}
 		node.Enabled = enabled != 0
+		node.TrafficExhausted = exhausted != 0
 		scanNodeTags(&node, tagsJSON)
 		scanRelayGroupNodeIDs(&node, relayGroupIDsJSON)
 		nodes = append(nodes, node)
@@ -441,14 +445,16 @@ func (r *TrafficRepository) GetNode(ctx context.Context, id int64, username stri
 	var enabled int
 	var tagsJSON string
 	var relayGroupIDsJSON string
-	row := r.db.QueryRowContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(relay_group_name, ''), COALESCE(relay_group_node_ids, '[]'), COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes WHERE id = ? AND username = ? LIMIT 1`, id, username)
-	if err := row.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.RelayGroupName, &relayGroupIDsJSON, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
+	var exhausted int
+	row := r.db.QueryRowContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(relay_group_name, ''), COALESCE(relay_group_node_ids, '[]'), COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), COALESCE(traffic_limit_bytes,0), COALESCE(traffic_used_offset,0), COALESCE(traffic_reset_day,0), COALESCE(traffic_exhausted,0), last_traffic_reset_at, created_at, updated_at FROM nodes WHERE id = ? AND username = ? LIMIT 1`, id, username)
+	if err := row.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.RelayGroupName, &relayGroupIDsJSON, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.TrafficLimitBytes, &node.TrafficUsedOffset, &node.TrafficResetDay, &exhausted, &node.LastTrafficResetAt, &node.CreatedAt, &node.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return node, ErrNodeNotFound
 		}
 		return node, fmt.Errorf("get node: %w", err)
 	}
 	node.Enabled = enabled != 0
+	node.TrafficExhausted = exhausted != 0
 	scanNodeTags(&node, tagsJSON)
 	scanRelayGroupNodeIDs(&node, relayGroupIDsJSON)
 
@@ -470,14 +476,16 @@ func (r *TrafficRepository) GetNodeByID(ctx context.Context, id int64) (Node, er
 	var enabled int
 	var tagsJSON string
 	var relayGroupIDsJSON string
-	row := r.db.QueryRowContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(relay_group_name, ''), COALESCE(relay_group_node_ids, '[]'), COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), created_at, updated_at FROM nodes WHERE id = ? LIMIT 1`, id)
-	if err := row.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.RelayGroupName, &relayGroupIDsJSON, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.CreatedAt, &node.UpdatedAt); err != nil {
+	var exhausted int
+	row := r.db.QueryRowContext(ctx, `SELECT id, username, raw_url, node_name, protocol, parsed_config, clash_config, enabled, COALESCE(tag, 'personal'), COALESCE(tags, '[]'), COALESCE(original_server, ''), COALESCE(original_domain, ''), COALESCE(inbound_tag, ''), chain_proxy_node_id, COALESCE(relay_group_name, ''), COALESCE(relay_group_node_ids, '[]'), COALESCE(node_type, 'physical'), parent_node_id, COALESCE(routed_outbound_tag, ''), COALESCE(routed_owner, 'shared'), COALESCE(relay_orig_server, ''), COALESCE(relay_orig_port, 0), COALESCE(traffic_limit_bytes,0), COALESCE(traffic_used_offset,0), COALESCE(traffic_reset_day,0), COALESCE(traffic_exhausted,0), last_traffic_reset_at, created_at, updated_at FROM nodes WHERE id = ? LIMIT 1`, id)
+	if err := row.Scan(&node.ID, &node.Username, &node.RawURL, &node.NodeName, &node.Protocol, &node.ParsedConfig, &node.ClashConfig, &enabled, &node.Tag, &tagsJSON, &node.OriginalServer, &node.OriginalDomain, &node.InboundTag, &node.ChainProxyNodeID, &node.RelayGroupName, &relayGroupIDsJSON, &node.NodeType, &node.ParentNodeID, &node.RoutedOutboundTag, &node.RoutedOwner, &node.RelayOrigServer, &node.RelayOrigPort, &node.TrafficLimitBytes, &node.TrafficUsedOffset, &node.TrafficResetDay, &exhausted, &node.LastTrafficResetAt, &node.CreatedAt, &node.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return node, ErrNodeNotFound
 		}
 		return node, fmt.Errorf("get node by id: %w", err)
 	}
 	node.Enabled = enabled != 0
+	node.TrafficExhausted = exhausted != 0
 	scanNodeTags(&node, tagsJSON)
 	scanRelayGroupNodeIDs(&node, relayGroupIDsJSON)
 
@@ -612,6 +620,131 @@ func (r *TrafficRepository) UpdateNode(ctx context.Context, node Node) (Node, er
 	}
 
 	return r.GetNode(ctx, node.ID, node.Username)
+}
+
+// UpdateNodeTrafficLimit updates the global, shared quota of a managed node.
+// limitBytes=0 disables the quota; resetDay=0 means no automatic reset.
+func (r *TrafficRepository) UpdateNodeTrafficLimit(ctx context.Context, id, limitBytes int64, resetDay int) error {
+	if id <= 0 || limitBytes < 0 || resetDay < 0 || resetDay > 31 {
+		return errors.New("invalid node traffic limit")
+	}
+	_, err := r.db.ExecContext(ctx, `UPDATE nodes SET traffic_limit_bytes=?, traffic_reset_day=?,
+		updated_at=CURRENT_TIMESTAMP WHERE id=?`, limitBytes, resetDay, id)
+	return err
+}
+
+// GetNodeTrafficUsed returns the raw shared traffic used by every account on a node.
+// Physical nodes use the exact inbound counter; routed nodes use per-node attribution.
+func (r *TrafficRepository) GetNodeTrafficUsed(ctx context.Context, node Node) (int64, error) {
+	var total float64
+	if node.NodeType == "routed" {
+		if err := r.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(uplink+downlink),0)
+			FROM traffic_daily_user_nodes WHERE node_id=?`, node.ID).Scan(&total); err != nil {
+			return 0, err
+		}
+	} else {
+		server, err := r.GetRemoteServerByName(ctx, node.OriginalServer)
+		if err != nil || server == nil {
+			return 0, fmt.Errorf("resolve node server %q: %w", node.OriginalServer, err)
+		}
+		if err := r.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(uplink+downlink),0)
+			FROM node_traffic WHERE server_id=? AND tag=? AND type='inbound'`, server.ID, node.InboundTag).Scan(&total); err != nil {
+			return 0, err
+		}
+	}
+	used := int64(total) + node.TrafficUsedOffset
+	if used < 0 {
+		used = 0
+	}
+	return used, nil
+}
+
+func (r *TrafficRepository) ListTrafficLimitedNodes(ctx context.Context) ([]Node, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT id FROM nodes WHERE traffic_limit_bytes>0 OR traffic_exhausted=1 ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	var out []Node
+	for _, id := range ids {
+		n, err := r.GetNodeByID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+func (r *TrafficRepository) SetNodeTrafficExhausted(ctx context.Context, id int64, exhausted bool) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE nodes SET traffic_exhausted=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, boolToInt(exhausted), id)
+	return err
+}
+
+// ResetNodeTrafficCycle keeps history and moves the logical baseline to current usage.
+func (r *TrafficRepository) ResetNodeTrafficCycle(ctx context.Context, node Node, at time.Time) error {
+	used, err := r.GetNodeTrafficUsed(ctx, node)
+	if err != nil {
+		return err
+	}
+	newOffset := node.TrafficUsedOffset - used
+	_, err = r.db.ExecContext(ctx, `UPDATE nodes SET traffic_used_offset=?,
+		last_traffic_reset_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?`, newOffset, at, node.ID)
+	return err
+}
+
+type NodeTrafficSuspension struct {
+	NodeID         int64
+	Username       string
+	Kind           string
+	CredentialJSON string
+}
+
+func (r *TrafficRepository) SaveNodeTrafficSuspension(ctx context.Context, nodeID int64, username, kind, credentialJSON string) error {
+	_, err := r.db.ExecContext(ctx, `INSERT INTO node_traffic_suspensions(node_id,username,kind,credential_json)
+		VALUES(?,?,?,?) ON CONFLICT(node_id,username,kind) DO UPDATE SET credential_json=excluded.credential_json`, nodeID, username, kind, credentialJSON)
+	return err
+}
+
+func (r *TrafficRepository) ListNodeTrafficSuspensions(ctx context.Context, nodeID int64) ([]NodeTrafficSuspension, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT node_id,username,kind,credential_json FROM node_traffic_suspensions WHERE node_id=? ORDER BY username`, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []NodeTrafficSuspension
+	for rows.Next() {
+		var s NodeTrafficSuspension
+		if err := rows.Scan(&s.NodeID, &s.Username, &s.Kind, &s.CredentialJSON); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+func (r *TrafficRepository) DeleteNodeTrafficSuspension(ctx context.Context, nodeID int64, username, kind string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM node_traffic_suspensions WHERE node_id=? AND username=? AND kind=?`, nodeID, username, kind)
+	return err
+}
+
+func (r *TrafficRepository) HasPhysicalNodeTrafficSuspension(ctx context.Context, username string, serverID int64, inboundTag string) bool {
+	var count int
+	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM node_traffic_suspensions s
+		JOIN nodes n ON n.id=s.node_id
+		JOIN remote_servers rs ON rs.name=n.original_server
+		WHERE s.kind='physical' AND s.username=? AND rs.id=? AND n.inbound_tag=?`,
+		username, serverID, inboundTag).Scan(&count)
+	return err == nil && count > 0
 }
 
 // 删除代理节点。
