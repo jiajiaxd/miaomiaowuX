@@ -2106,6 +2106,25 @@ func nodeOutboundTarget(ctx context.Context, repo *storage.TrafficRepository, no
 	return t, true
 }
 
+// nodeTunnelTarget returns the destination baked into a tunnel inbound. When
+// “create node” is disabled, applying the tunnel mutates the original node's
+// Clash server/port to the tunnel entry and stores the real destination in
+// relay_orig_*. Tunnel cleanup must therefore match relay_orig_*; matching the
+// mutated Clash endpoint leaves the tunnel inbound behind and its port occupied.
+func nodeTunnelTarget(ctx context.Context, repo *storage.TrafficRepository, node *storage.Node) (outboundTarget, bool) {
+	target, ok := nodeOutboundTarget(ctx, repo, node)
+	if !ok {
+		return outboundTarget{}, false
+	}
+	if node.RelayOrigPort > 0 {
+		target.port = node.RelayOrigPort
+	}
+	if original := strings.TrimSpace(node.RelayOrigServer); original != "" {
+		target.addrSet[original] = true
+	}
+	return target, target.port > 0 && len(target.addrSet) > 0
+}
+
 // outboundTargetsNode adds credential disambiguation for SOCKS5. Multiple
 // upstream accounts commonly share one IP:port; deleting one node must not
 // remove outbounds belonging to another account.
@@ -2220,7 +2239,7 @@ func (h *nodesHandler) cleanupTunnelsTargetingNodes(ctx context.Context, nodes [
 	}
 	targets := make([]outboundTarget, 0, len(nodes))
 	for i := range nodes {
-		if target, ok := nodeOutboundTarget(ctx, h.repo, &nodes[i]); ok {
+		if target, ok := nodeTunnelTarget(ctx, h.repo, &nodes[i]); ok {
 			targets = append(targets, target)
 		}
 	}

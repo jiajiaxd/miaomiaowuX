@@ -1,10 +1,26 @@
 package handler
 
 import (
+	"context"
 	"testing"
 
 	"miaomiaowux/internal/storage"
 )
+
+func TestNodeTunnelTargetUsesOriginalEndpointAfterInPlaceRelay(t *testing.T) {
+	node := storage.Node{
+		ClashConfig:     `{"name":"n","type":"vless","server":"relay.example","port":32000}`,
+		RelayOrigServer: "origin.example",
+		RelayOrigPort:   443,
+	}
+	target, ok := nodeTunnelTarget(context.Background(), nil, &node)
+	if !ok {
+		t.Fatal("expected tunnel target")
+	}
+	if target.port != 443 || !target.addrSet["origin.example"] {
+		t.Fatalf("target=%+v, want origin.example:443", target)
+	}
+}
 
 func TestSubEmailBaselineFallsBackAsOneCycle(t *testing.T) {
 	row := storage.UserEmailTraffic{ServerID: 7, Email: "tom__in", Uplink: 13, Downlink: 75}
