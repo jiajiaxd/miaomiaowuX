@@ -35,16 +35,15 @@ import (
 	"miaomiaowux/internal/securechan"
 )
 
-
 // 协议常量(必须与前端 src/lib/securechan.ts 保持一致)
 const (
-	secureChannelVersion        = "v1"
-	headerSecureChannel         = "X-Secure-Channel"
-	headerSessionID             = "X-Session-Id"
-	headerSecureChannelExpired  = "X-Secure-Channel-Expired"
-	userSessionTTL              = 30 * time.Minute
-	maxEncryptedBodyBytes       = 8 << 20 // 8 MiB,防 DoS
-	sessionIDBytes              = 16      // 128-bit session id
+	secureChannelVersion       = "v1"
+	headerSecureChannel        = "X-Secure-Channel"
+	headerSessionID            = "X-Session-Id"
+	headerSecureChannelExpired = "X-Secure-Channel-Expired"
+	userSessionTTL             = 30 * time.Minute
+	maxEncryptedBodyBytes      = 8 << 20 // 8 MiB,防 DoS
+	sessionIDBytes             = 16      // 128-bit session id
 )
 
 // UserSecureChannelHandler 管理前端会话池 + 提供握手 endpoint。
@@ -111,6 +110,8 @@ func (h *UserSecureChannelHandler) Handshake(w http.ResponseWriter, r *http.Requ
 	now := time.Now()
 	h.sessions.Store(sid, &userSession{sess: sess, createdAt: now, lastUsed: now})
 
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, private")
+	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{
 		"session_id":     sid,
