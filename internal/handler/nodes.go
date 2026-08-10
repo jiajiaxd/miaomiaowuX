@@ -187,11 +187,6 @@ func (h *nodesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleGetRelatedInbounds(w, r, idSegment)
 	case strings.HasSuffix(path, "/uri") && r.Method == http.MethodGet:
 		h.handleNodeURI(w, r, strings.TrimSuffix(path, "/uri"))
-	case strings.HasSuffix(path, "/traffic/reset") && r.Method == http.MethodPost:
-		if denyNonAdmin() {
-			return
-		}
-		h.handleResetNodeTraffic(w, r, strings.TrimSuffix(path, "/traffic/reset"))
 	case strings.HasSuffix(path, "/server") && r.Method == http.MethodPut:
 		if denyNonAdmin() {
 			return
@@ -290,7 +285,7 @@ func (h *nodesHandler) handleList(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.URL.Query().Get("include_private") == "1" {
-			respondJSON(w, http.StatusOK, map[string]any{"nodes": h.convertNodesWithTraffic(r.Context(), nodes)})
+			respondJSON(w, http.StatusOK, map[string]any{"nodes": convertNodes(nodes)})
 			return
 		}
 		nonAdmins, err := h.repo.ListNonAdminUsernames(r.Context())
@@ -305,7 +300,7 @@ func (h *nodesHandler) handleList(w http.ResponseWriter, r *http.Request) {
 			}
 			filtered = append(filtered, n)
 		}
-		respondJSON(w, http.StatusOK, map[string]any{"nodes": h.convertNodesWithTraffic(r.Context(), filtered)})
+		respondJSON(w, http.StatusOK, map[string]any{"nodes": convertNodes(filtered)})
 		return
 	}
 
@@ -322,7 +317,7 @@ func (h *nodesHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	nodes = substituteNodesForUser(r.Context(), h.repo, username, nodes)
 
 	// 节点级倍率:根据用户绑定套餐查 multiplier(routed 子节点用 parent 回退),仅当 != 1 时写入响应
-	dto := h.convertNodesWithTraffic(r.Context(), nodes)
+	dto := convertNodes(nodes)
 	// 安全:普通用户视角绝不暴露中转节点的真实源站地址。clash/parsed 的 server/port 已是中转地址,
 	// relay_orig_*(被中转替换掉的真实地址)只供 admin 管理/取消中转。剥离后前端 relay_orig_server
 	// 为空 → 不显示"原服务器"行,只显示中转地址。
@@ -478,7 +473,6 @@ func substituteNodesForUser(ctx context.Context, repo *storage.TrafficRepository
 				continue
 			}
 			if raw, err := json.Marshal(proxy); err == nil {
-				applySharedNodeTrafficName(ctx, repo, n, proxy)
 				raw, _ = json.Marshal(proxy)
 				n.ClashConfig = string(raw)
 			}
@@ -496,7 +490,6 @@ func substituteNodesForUser(ctx context.Context, repo *storage.TrafficRepository
 			continue
 		}
 		applyUserCredentials(proxy, n, credMap)
-		applySharedNodeTrafficName(ctx, repo, n, proxy)
 		if raw, err := json.Marshal(proxy); err == nil {
 			n.ClashConfig = string(raw)
 		}
@@ -505,21 +498,21 @@ func substituteNodesForUser(ctx context.Context, repo *storage.TrafficRepository
 	return out
 }
 
-func applySharedNodeTrafficName(ctx context.Context, repo *storage.TrafficRepository, node storage.Node, proxy map[string]any) {
-	if repo == nil || node.TrafficLimitBytes <= 0 || proxy == nil {
+func applyPackageNodeTrafficName(ctx context.Context, repo *storage.TrafficRepository, username string, pkg *storage.Package, node storage.Node, proxy map[string]any) {
+	if repo == nil || pkg == nil || proxy == nil || pkg.NodeTrafficLimits[node.ID] <= 0 {
 		return
 	}
-	used, err := repo.GetNodeTrafficUsed(ctx, node)
-	if err != nil {
+	used, limit, err := repo.GetPackageNodeTrafficUsage(ctx, username, pkg.ID, node.ID)
+	if err != nil || limit <= 0 {
 		return
 	}
 	name, _ := proxy["name"].(string)
 	if name == "" {
 		name = node.NodeName
 	}
-	suffix := fmt.Sprintf(" [%s/%s]", formatTrafficShort(used), formatTrafficShort(node.TrafficLimitBytes))
-	if node.TrafficExhausted {
-		suffix = fmt.Sprintf(" [%s/%s · 已用尽]", formatTrafficShort(used), formatTrafficShort(node.TrafficLimitBytes))
+	suffix := fmt.Sprintf(" [%s/%s]", formatTrafficShort(used), formatTrafficShort(limit))
+	if used >= limit {
+		suffix = fmt.Sprintf(" [%s/%s · 已用尽]", formatTrafficShort(used), formatTrafficShort(limit))
 	}
 	proxy["name"] = name + suffix
 }
@@ -566,14 +559,6 @@ func (h *nodesHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	req.parseChainProxyNodeID()
 	req.parseRelayGroup()
-	if req.TrafficLimitGB != nil && *req.TrafficLimitGB < 0 {
-		writeBadRequest(w, "节点流量限制不能为负")
-		return
-	}
-	if req.TrafficResetDay != nil && (*req.TrafficResetDay < 0 || *req.TrafficResetDay > 31) {
-		writeBadRequest(w, "节点流量重置日必须为 0-31")
-		return
-	}
 
 	// 校验节点名称不为空
 	if strings.TrimSpace(req.NodeName) == "" {
@@ -640,11 +625,6 @@ func (h *nodesHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusForbidden, rejectMsg)
 		return
 	}
-	if req.TrafficLimitGB != nil && *req.TrafficLimitGB > 0 &&
-		(node.OriginalServer == "" || node.InboundTag == "") {
-		writeBadRequest(w, "只有主控管理的入站节点可以设置共享流量限制")
-		return
-	}
 
 	// 中转:license 校验后再挂 —— clash/parsed 的 server/port 换成中转地址,原服务器地址/端口记到 relay_orig_*。
 	if rs := strings.TrimSpace(req.RelayServer); rs != "" {
@@ -656,21 +636,6 @@ func (h *nodesHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 		logger.Info("[节点创建] 数据库创建失败", "error", err)
 		writeError(w, http.StatusBadRequest, err)
 		return
-	}
-	if req.TrafficLimitGB != nil || req.TrafficResetDay != nil {
-		limit := int64(0)
-		if req.TrafficLimitGB != nil {
-			limit = int64(*req.TrafficLimitGB * 1024 * 1024 * 1024)
-		}
-		day := 0
-		if req.TrafficResetDay != nil {
-			day = *req.TrafficResetDay
-		}
-		if err := h.repo.UpdateNodeTrafficLimit(r.Context(), created.ID, limit, day); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		created, _ = h.repo.GetNodeByID(r.Context(), created.ID)
 	}
 
 	logger.Info("[节点创建] 成功 - ID, 节点名称", "id", created.ID, "node_name", created.NodeName)
@@ -790,19 +755,6 @@ func (h *nodesHandler) handleUpdate(w http.ResponseWriter, r *http.Request, idSe
 	}
 	req.parseChainProxyNodeID()
 	req.parseRelayGroup()
-	if isAdmin && req.TrafficLimitGB != nil && *req.TrafficLimitGB < 0 {
-		writeBadRequest(w, "节点流量限制不能为负")
-		return
-	}
-	if isAdmin && req.TrafficResetDay != nil && (*req.TrafficResetDay < 0 || *req.TrafficResetDay > 31) {
-		writeBadRequest(w, "节点流量重置日必须为 0-31")
-		return
-	}
-	if isAdmin && req.TrafficLimitGB != nil && *req.TrafficLimitGB > 0 &&
-		(existing.OriginalServer == "" || existing.InboundTag == "") {
-		writeBadRequest(w, "只有主控管理的入站节点可以设置共享流量限制")
-		return
-	}
 
 	// 普通用户:只能改自己节点的「名称」。归属已由 fetchNodeForAccess 限制为本人节点(套餐/admin
 	// 节点取不到 → 404)。强制只保留 NodeName、其余字段沿用原节点,防止越权改配置/协议/标签/启用状态。
@@ -899,25 +851,6 @@ func (h *nodesHandler) handleUpdate(w http.ResponseWriter, r *http.Request, idSe
 		writeError(w, status, err)
 		return
 	}
-	if isAdmin && (req.TrafficLimitGB != nil || req.TrafficResetDay != nil) {
-		limit := updated.TrafficLimitBytes
-		if req.TrafficLimitGB != nil {
-			limit = int64(*req.TrafficLimitGB * 1024 * 1024 * 1024)
-		}
-		day := updated.TrafficResetDay
-		if req.TrafficResetDay != nil {
-			day = *req.TrafficResetDay
-		}
-		if limit > 0 && (updated.OriginalServer == "" || updated.InboundTag == "") {
-			writeBadRequest(w, "只有主控管理的入站节点可以设置共享流量限制")
-			return
-		}
-		if err := h.repo.UpdateNodeTrafficLimit(r.Context(), updated.ID, limit, day); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		updated, _ = h.repo.GetNodeByID(r.Context(), updated.ID)
-	}
 
 	logger.Info("[节点更新] 数据库更新成功 - 节点ID, 节点名称", "id", updated.ID, "node_name", updated.NodeName)
 
@@ -934,35 +867,6 @@ func (h *nodesHandler) handleUpdate(w http.ResponseWriter, r *http.Request, idSe
 	respondJSON(w, http.StatusOK, map[string]any{
 		"node": convertNode(updated),
 	})
-}
-
-func (h *nodesHandler) handleResetNodeTraffic(w http.ResponseWriter, r *http.Request, idSegment string) {
-	id, err := strconv.ParseInt(strings.TrimSpace(idSegment), 10, 64)
-	if err != nil || id <= 0 {
-		writeBadRequest(w, "无效的节点标识")
-		return
-	}
-	node, err := h.repo.GetNodeByID(r.Context(), id)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err)
-		return
-	}
-	if err := h.repo.ResetNodeTrafficCycle(r.Context(), node, time.Now()); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if node.TrafficExhausted {
-		enforcer := NewTrafficLimitEnforcer(h.repo, h.remoteManage, nil)
-		if err := enforcer.restoreNodeTrafficAccess(r.Context(), node); err != nil {
-			writeError(w, http.StatusBadGateway, fmt.Errorf("流量已清零，但恢复节点用户失败，系统将自动重试: %w", err))
-			return
-		}
-		if err := h.repo.SetNodeTrafficExhausted(r.Context(), node.ID, false); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-	}
-	respondJSON(w, http.StatusOK, map[string]any{"status": "reset", "node_id": id})
 }
 
 func (h *nodesHandler) handleUpdateServer(w http.ResponseWriter, r *http.Request, idSegment string) {
@@ -2705,10 +2609,8 @@ type nodeRequest struct {
 	RelayGroupNodeIDs    []int64         `json:"-"`
 	RawRelayGroupNodeIDs json.RawMessage `json:"relay_group_node_ids"`
 	// 中转(relay):创建时若填写中转服务器,后端把 clash/parsed 的 server/port 换成中转地址,原值记到 relay_orig_*。
-	RelayServer     string   `json:"relay_server"`
-	RelayPort       int      `json:"relay_port"`
-	TrafficLimitGB  *float64 `json:"traffic_limit_gb,omitempty"`
-	TrafficResetDay *int     `json:"traffic_reset_day,omitempty"`
+	RelayServer string `json:"relay_server"`
+	RelayPort   int    `json:"relay_port"`
 }
 
 func (r *nodeRequest) hasChainProxyNodeID() bool {
@@ -2764,11 +2666,7 @@ type nodeDTO struct {
 	CreatedBy         string   `json:"created_by,omitempty"`   // routed 节点专用:创建者用户名(user 视角下用于鉴别"是不是我创建的")
 	// Multiplier 仅在普通用户视角(其绑定套餐内有 NodeMultipliers 配置)下注入。admin 视角省略字段
 	// (一个节点可能在多个套餐里有不同倍率,无法单值显示);== 1 时也省略,前端按"未设置"对待。
-	Multiplier       float64 `json:"multiplier,omitempty"`
-	TrafficLimitGB   float64 `json:"traffic_limit_gb"`
-	TrafficUsed      int64   `json:"traffic_used"`
-	TrafficResetDay  int     `json:"traffic_reset_day"`
-	TrafficExhausted bool    `json:"traffic_exhausted"`
+	Multiplier float64 `json:"multiplier,omitempty"`
 	// 中转(relay):relay_orig_server 非空表示该节点已配置中转 —— clash server/port 是中转地址,
 	// 这两个字段是被中转替换掉的原服务器地址/端口,前端在「服务器地址」下方显示 + 用于编辑/取消中转。
 	RelayOrigServer string    `json:"relay_orig_server,omitempty"`
@@ -2860,25 +2758,9 @@ func convertNode(node storage.Node) nodeDTO {
 		CreatedBy:         node.Username, // nodes 表里 username = 创建/拥有者
 		RelayOrigServer:   node.RelayOrigServer,
 		RelayOrigPort:     node.RelayOrigPort,
-		TrafficLimitGB:    float64(node.TrafficLimitBytes) / (1024 * 1024 * 1024),
-		TrafficResetDay:   node.TrafficResetDay,
-		TrafficExhausted:  node.TrafficExhausted,
 		CreatedAt:         node.CreatedAt,
 		UpdatedAt:         node.UpdatedAt,
 	}
-}
-
-func (h *nodesHandler) convertNodesWithTraffic(ctx context.Context, nodes []storage.Node) []nodeDTO {
-	out := convertNodes(nodes)
-	for i := range nodes {
-		if nodes[i].TrafficLimitBytes <= 0 {
-			continue
-		}
-		if used, err := h.repo.GetNodeTrafficUsed(ctx, nodes[i]); err == nil {
-			out[i].TrafficUsed = used
-		}
-	}
-	return out
 }
 
 func convertNodes(nodes []storage.Node) []nodeDTO {

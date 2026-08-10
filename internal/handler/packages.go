@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -96,8 +97,9 @@ type createPackageRequest struct {
 	NodeMultipliers         map[int64]float64            `json:"node_multipliers"`    // node_id → 倍率
 	NodeNameOverrides       map[int64]string             `json:"node_name_overrides"` // node_id → 套餐内显示名
 	NodeNameOverrideEnabled bool                         `json:"node_name_override_enabled"`
-	NodeSpeedLimits         map[int64]float64            `json:"node_speed_limits"`  // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
-	NodeDeviceLimits        map[int64]int                `json:"node_device_limits"` // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	NodeSpeedLimits         map[int64]float64            `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
+	NodeDeviceLimits        map[int64]int                `json:"node_device_limits"`  // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	NodeTrafficLimits       map[int64]float64            `json:"node_traffic_limits"` // 套餐内每个用户独立的节点流量额度(GB);0/缺省=不限
 	SpeedLimitMbps          float64                      `json:"speed_limit_mbps"`
 	DeviceLimit             int                          `json:"device_limit"`
 	AutoSpeedRules          []storage.AutoSpeedLimitRule `json:"auto_speed_rules"`
@@ -134,6 +136,22 @@ func normalizePackageNodeNames(names map[int64]string, nodes []int64) (map[int64
 		out[id] = value
 	}
 	return out, nil
+}
+
+func validatePackageNodeTrafficLimits(limits map[int64]float64, nodes []int64) error {
+	allowed := make(map[int64]bool, len(nodes))
+	for _, id := range nodes {
+		allowed[id] = true
+	}
+	for id, limit := range limits {
+		if !allowed[id] {
+			return fmt.Errorf("节点 %d 不在套餐内", id)
+		}
+		if limit < 0 || math.IsNaN(limit) || math.IsInf(limit, 0) {
+			return fmt.Errorf("节点 %d 的流量额度无效", id)
+		}
+	}
+	return nil
 }
 
 // validatePackageTemplateFilename 非空时校验 rule_templates 下文件存在。空字符串直接通过(表示用系统默认)。
@@ -230,6 +248,10 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validatePackageNodeTrafficLimits(req.NodeTrafficLimits, nodes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	trafficMode := req.TrafficMode
 	if trafficMode == "" {
@@ -250,6 +272,7 @@ func (h *PackageCreateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		NodeNameOverrideEnabled: req.NodeNameOverrideEnabled,
 		NodeSpeedLimits:         req.NodeSpeedLimits,
 		NodeDeviceLimits:        req.NodeDeviceLimits,
+		NodeTrafficLimits:       req.NodeTrafficLimits,
 		SpeedLimitMbps:          req.SpeedLimitMbps,
 		DeviceLimit:             req.DeviceLimit,
 		AutoSpeedRules:          req.AutoSpeedRules,
@@ -305,8 +328,9 @@ type updatePackageRequest struct {
 	NodeMultipliers         map[int64]float64            `json:"node_multipliers"`    // node_id → 倍率
 	NodeNameOverrides       map[int64]string             `json:"node_name_overrides"` // node_id → 套餐内显示名
 	NodeNameOverrideEnabled bool                         `json:"node_name_override_enabled"`
-	NodeSpeedLimits         map[int64]float64            `json:"node_speed_limits"`  // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
-	NodeDeviceLimits        map[int64]int                `json:"node_device_limits"` // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	NodeSpeedLimits         map[int64]float64            `json:"node_speed_limits"`   // 套餐 per-node 限速覆盖 (Mbps);0=显式不限速,缺省=继承 SpeedLimitMbps
+	NodeDeviceLimits        map[int64]int                `json:"node_device_limits"`  // 套餐 per-node 客户端数覆盖;0=显式不限,缺省=继承 DeviceLimit
+	NodeTrafficLimits       map[int64]float64            `json:"node_traffic_limits"` // 套餐内每个用户独立的节点流量额度(GB);0/缺省=不限
 	SpeedLimitMbps          float64                      `json:"speed_limit_mbps"`
 	DeviceLimit             int                          `json:"device_limit"`
 	AutoSpeedRules          []storage.AutoSpeedLimitRule `json:"auto_speed_rules"`
@@ -373,6 +397,10 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validatePackageNodeTrafficLimits(req.NodeTrafficLimits, nodes); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	// 获取旧套餐的节点列表，用于后续计算差异
 	var oldNodes []int64
@@ -419,6 +447,7 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		NodeNameOverrideEnabled: req.NodeNameOverrideEnabled,
 		NodeSpeedLimits:         req.NodeSpeedLimits,
 		NodeDeviceLimits:        req.NodeDeviceLimits,
+		NodeTrafficLimits:       req.NodeTrafficLimits,
 		SpeedLimitMbps:          req.SpeedLimitMbps,
 		DeviceLimit:             req.DeviceLimit,
 		AutoSpeedRules:          req.AutoSpeedRules,

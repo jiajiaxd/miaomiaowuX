@@ -2,13 +2,10 @@ package handler
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
@@ -330,194 +327,171 @@ func (e *TrafficLimitEnforcer) CheckAll(ctx context.Context) (string, error) {
 	if serverResetErr != nil {
 		runErrors = append(runErrors, serverResetErr)
 	}
-	nodeChecked, nodeErr := e.CheckNodeTrafficLimits(ctx, now)
-	if nodeErr != nil {
-		runErrors = append(runErrors, nodeErr)
+	packageNodeChecked, packageNodeErr := e.CheckPackageNodeTrafficLimits(ctx)
+	if packageNodeErr != nil {
+		runErrors = append(runErrors, packageNodeErr)
 	}
 
-	summary := fmt.Sprintf("users_reset=%d servers_reset=%d nodes_checked=%d", userResetCount, serverResetCount, nodeChecked)
+	summary := fmt.Sprintf("users_reset=%d servers_reset=%d package_nodes_checked=%d", userResetCount, serverResetCount, packageNodeChecked)
 	return summary, errors.Join(runErrors...)
 }
 
-// CheckNodeTrafficLimits enforces a quota shared by every account using a node.
-// Remote changes are retried until complete; the exhausted flag is only cleared
-// after every account recorded in node_traffic_suspensions has been restored.
-func (e *TrafficLimitEnforcer) CheckNodeTrafficLimits(ctx context.Context, now time.Time) (int, error) {
-	nodes, err := e.repo.ListTrafficLimitedNodes(ctx)
+// CheckPackageNodeTrafficLimits applies each package node quota independently
+// to every bound user. Exhausting node A never disables the user's other nodes
+// and never consumes another user's quota on A.
+func (e *TrafficLimitEnforcer) CheckPackageNodeTrafficLimits(ctx context.Context) (int, error) {
+	users, err := e.repo.ListUsersWithPackage(ctx)
 	if err != nil {
 		return 0, err
 	}
+	packages := make(map[int64]*storage.Package)
+	checked := 0
 	var errs []error
-	for _, node := range nodes {
-		if node.TrafficLimitBytes > 0 && node.TrafficResetDay > 0 && shouldResetThisMonth(now, true, node.TrafficResetDay, node.LastTrafficResetAt) {
-			if err := e.repo.ResetNodeTrafficCycle(ctx, node, now); err != nil {
-				errs = append(errs, fmt.Errorf("reset node %d: %w", node.ID, err))
-				continue
-			}
-			if refreshed, refreshErr := e.repo.GetNodeByID(ctx, node.ID); refreshErr == nil {
-				node = refreshed
-			}
-		}
-		used, err := e.repo.GetNodeTrafficUsed(ctx, node)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("read node %d traffic: %w", node.ID, err))
+	for _, user := range users {
+		if !user.IsActive || user.PackageID <= 0 {
 			continue
 		}
-		over := node.TrafficLimitBytes > 0 && used >= node.TrafficLimitBytes
-		if over {
-			if err := e.suspendNodeTrafficAccess(ctx, node); err != nil {
-				errs = append(errs, fmt.Errorf("suspend node %d: %w", node.ID, err))
+		pkg := packages[user.PackageID]
+		if pkg == nil {
+			pkg, err = e.repo.GetPackage(ctx, user.PackageID)
+			if err != nil {
+				errs = append(errs, err)
 				continue
 			}
-			if !node.TrafficExhausted {
-				_ = e.repo.SetNodeTrafficExhausted(ctx, node.ID, true)
-			}
-		} else if node.TrafficExhausted {
-			if err := e.restoreNodeTrafficAccess(ctx, node); err != nil {
-				errs = append(errs, fmt.Errorf("restore node %d: %w", node.ID, err))
+			packages[user.PackageID] = pkg
+		}
+		for nodeID, limitGB := range pkg.NodeTrafficLimits {
+			if limitGB <= 0 {
 				continue
 			}
-			_ = e.repo.SetNodeTrafficExhausted(ctx, node.ID, false)
+			checked++
+			used, limit, usageErr := e.repo.GetPackageNodeTrafficUsage(ctx, user.Username, pkg.ID, nodeID)
+			if usageErr != nil {
+				errs = append(errs, fmt.Errorf("read %s package node %d usage: %w", user.Username, nodeID, usageErr))
+				continue
+			}
+			suspended := e.repo.HasPackageNodeTrafficSuspension(ctx, user.Username, nodeID)
+			if used >= limit && !suspended {
+				if err := e.suspendPackageNodeTrafficAccess(ctx, user, pkg.ID, nodeID); err != nil {
+					errs = append(errs, err)
+				}
+			} else if used < limit && suspended {
+				if err := e.restorePackageNodeTrafficAccess(ctx, user, pkg.ID, nodeID); err != nil {
+					errs = append(errs, err)
+				}
+			}
 		}
 	}
-	return len(nodes), errors.Join(errs...)
+	// Also restore stale records after a quota/package was removed.
+	suspensions, listErr := e.repo.ListPackageNodeTrafficSuspensions(ctx)
+	if listErr != nil {
+		errs = append(errs, listErr)
+	} else {
+		for _, s := range suspensions {
+			user, userErr := e.repo.GetUser(ctx, s.Username)
+			if userErr != nil || !user.IsActive {
+				continue
+			}
+			pkg := packages[user.PackageID]
+			if pkg == nil {
+				pkg, _ = e.repo.GetPackage(ctx, user.PackageID)
+			}
+			if user.PackageID != s.PackageID || pkg == nil {
+				_ = e.repo.DeletePackageNodeTrafficSuspension(ctx, s.Username, s.PackageID, s.NodeID, s.Kind)
+				continue
+			}
+			if pkg.NodeTrafficLimits[s.NodeID] <= 0 {
+				if err := e.restorePackageNodeTrafficAccess(ctx, user, s.PackageID, s.NodeID); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+	}
+	return checked, errors.Join(errs...)
 }
 
-func (e *TrafficLimitEnforcer) suspendNodeTrafficAccess(ctx context.Context, node storage.Node) error {
+func (e *TrafficLimitEnforcer) suspendPackageNodeTrafficAccess(ctx context.Context, user storage.User, packageID, nodeID int64) error {
+	node, err := e.repo.GetNodeByID(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	kind := "physical"
+	credentialJSON := ""
 	if node.NodeType == "routed" {
-		subs, err := e.repo.ListSubaccountsByRoutedNode(ctx, node.ID)
+		kind = "routed"
+		s := storage.PackageNodeTrafficSuspension{Username: user.Username, PackageID: packageID, NodeID: nodeID, Kind: kind}
+		if err := e.repo.SavePackageNodeTrafficSuspension(ctx, s); err != nil {
+			return err
+		}
+		if err := removeUserFromRoutedNode(ctx, e.remoteManage, e.repo, user.Username, node.ID); err != nil {
+			_ = e.repo.DeletePackageNodeTrafficSuspension(ctx, user.Username, packageID, nodeID, kind)
+			return fmt.Errorf("suspend %s on routed node %d: %w", user.Username, node.ID, err)
+		}
+		return nil
+	} else {
+		server, err := e.repo.GetRemoteServerByName(ctx, node.OriginalServer)
+		if err != nil || server == nil {
+			return fmt.Errorf("server %s not found", node.OriginalServer)
+		}
+		cfg, err := e.repo.GetUserInboundConfig(ctx, user.Username, server.ID, node.InboundTag)
 		if err != nil {
 			return err
 		}
-		var errs []error
-		for _, sa := range subs {
-			if !sa.IsActive {
-				continue
-			}
-			if err := removeUserFromRoutedNode(ctx, e.remoteManage, e.repo, sa.Username, node.ID); err != nil {
-				errs = append(errs, fmt.Errorf("%s: %w", sa.Username, err))
-				continue
-			}
-			_ = e.repo.SaveNodeTrafficSuspension(ctx, node.ID, sa.Username, "routed", "")
+		var credential map[string]interface{}
+		if err := json.Unmarshal([]byte(cfg.CredentialJSON), &credential); err != nil {
+			return err
 		}
-		return errors.Join(errs...)
+		credentialJSON = cfg.CredentialJSON
+		s := storage.PackageNodeTrafficSuspension{Username: user.Username, PackageID: packageID, NodeID: nodeID, Kind: kind, CredentialJSON: credentialJSON}
+		if err := e.repo.SavePackageNodeTrafficSuspension(ctx, s); err != nil {
+			return err
+		}
+		if err := mutateInboundClient(ctx, e.remoteManage, server.ID, node.InboundTag, "remove-client", credential); err != nil && !isInboundNotFoundErr(err) {
+			_ = e.repo.DeletePackageNodeTrafficSuspension(ctx, user.Username, packageID, nodeID, kind)
+			return err
+		}
+		return nil
+	}
+}
+
+func (e *TrafficLimitEnforcer) restorePackageNodeTrafficAccess(ctx context.Context, user storage.User, packageID, nodeID int64) error {
+	node, err := e.repo.GetNodeByID(ctx, nodeID)
+	if err != nil {
+		return err
+	}
+	if over, _ := e.repo.IsUserOverLimit(ctx, user.Username); over {
+		return nil
+	}
+	if node.NodeType == "routed" {
+		if err := addUserToRoutedNode(ctx, e.remoteManage, e.repo, user, node.ID); err != nil {
+			return err
+		}
+		return e.repo.DeletePackageNodeTrafficSuspension(ctx, user.Username, packageID, nodeID, "routed")
 	}
 	server, err := e.repo.GetRemoteServerByName(ctx, node.OriginalServer)
 	if err != nil || server == nil {
 		return fmt.Errorf("server %s not found", node.OriginalServer)
 	}
-	raw, err := e.remoteManage.forwardToRemoteServer(ctx, server.ID, "GET", "/api/child/inbounds", nil)
-	if err != nil {
-		return err
-	}
-	var response struct {
-		Success  bool                     `json:"success"`
-		Inbounds []map[string]interface{} `json:"inbounds"`
-	}
-	if err := json.Unmarshal(raw, &response); err != nil || !response.Success {
-		return fmt.Errorf("parse inbounds response: %v", err)
-	}
-	known, _ := e.repo.ListNodeTrafficSuspensions(ctx, node.ID)
-	already := make(map[string]bool, len(known))
-	for _, s := range known {
-		already[s.Username+"|"+s.Kind] = true
-	}
-	var errs []error
-	var target map[string]interface{}
-	for _, inbound := range response.Inbounds {
-		if fmt.Sprint(inbound["tag"]) == node.InboundTag {
-			target = inbound
+	var credentialJSON string
+	for _, s := range mustListPackageNodeSuspensions(ctx, e.repo) {
+		if s.Username == user.Username && s.PackageID == packageID && s.NodeID == nodeID && s.Kind == "physical" {
+			credentialJSON = s.CredentialJSON
 			break
 		}
 	}
-	if target == nil {
-		return fmt.Errorf("inbound %s not found", node.InboundTag)
-	}
-	settings, _ := target["settings"].(map[string]interface{})
-	for _, key := range []string{"clients", "users", "accounts"} {
-		items, _ := settings[key].([]interface{})
-		for _, item := range items {
-			credential, _ := item.(map[string]interface{})
-			if credential == nil {
-				continue
-			}
-			credentialJSON, _ := json.Marshal(credential)
-			identity := nodeTrafficCredentialIdentity(credential, credentialJSON)
-			if already[identity+"|physical"] {
-				continue
-			}
-			if err := e.repo.SaveNodeTrafficSuspension(ctx, node.ID, identity, "physical", string(credentialJSON)); err != nil {
-				errs = append(errs, fmt.Errorf("save %s suspension: %w", identity, err))
-				continue
-			}
-			if err := mutateInboundClient(ctx, e.remoteManage, server.ID, node.InboundTag, "remove-client", credential); err != nil && !isInboundNotFoundErr(err) {
-				_ = e.repo.DeleteNodeTrafficSuspension(ctx, node.ID, identity, "physical")
-				errs = append(errs, fmt.Errorf("%s: %w", identity, err))
-			}
-		}
-	}
-	return errors.Join(errs...)
-}
-
-func nodeTrafficCredentialIdentity(credential map[string]interface{}, raw []byte) string {
-	for _, key := range []string{"email", "user", "username", "clientId"} {
-		if value := strings.TrimSpace(fmt.Sprint(credential[key])); value != "" && value != "<nil>" {
-			return value
-		}
-	}
-	sum := sha256.Sum256(raw)
-	return "credential-" + hex.EncodeToString(sum[:8])
-}
-
-func (e *TrafficLimitEnforcer) restoreNodeTrafficAccess(ctx context.Context, node storage.Node) error {
-	suspended, err := e.repo.ListNodeTrafficSuspensions(ctx, node.ID)
-	if err != nil {
+	var credential map[string]interface{}
+	if err := json.Unmarshal([]byte(credentialJSON), &credential); err != nil {
 		return err
 	}
-	var errs []error
-	for _, s := range suspended {
-		if s.Kind == "routed" {
-			user, err := e.repo.GetUser(ctx, s.Username)
-			if err != nil || !user.IsActive {
-				_ = e.repo.DeleteNodeTrafficSuspension(ctx, node.ID, s.Username, s.Kind)
-				continue
-			}
-			if over, _ := e.repo.IsUserOverLimit(ctx, s.Username); over {
-				continue
-			}
-			if err := addUserToRoutedNode(ctx, e.remoteManage, e.repo, user, node.ID); err != nil {
-				errs = append(errs, fmt.Errorf("%s: %w", s.Username, err))
-				continue
-			}
-		} else {
-			if username := e.repo.ResolveUsernameByEmail(ctx, s.Username); username != "" {
-				user, userErr := e.repo.GetUser(ctx, username)
-				if userErr == nil && !user.IsActive {
-					_ = e.repo.DeleteNodeTrafficSuspension(ctx, node.ID, s.Username, s.Kind)
-					continue
-				}
-				if over, _ := e.repo.IsUserOverLimit(ctx, username); over {
-					continue
-				}
-			}
-			server, serr := e.repo.GetRemoteServerByName(ctx, node.OriginalServer)
-			if serr != nil || server == nil {
-				errs = append(errs, fmt.Errorf("server %s not found", node.OriginalServer))
-				continue
-			}
-			var credential map[string]interface{}
-			if json.Unmarshal([]byte(s.CredentialJSON), &credential) != nil || credential == nil {
-				_ = e.repo.DeleteNodeTrafficSuspension(ctx, node.ID, s.Username, s.Kind)
-				continue
-			}
-			if err := mutateInboundClient(ctx, e.remoteManage, server.ID, node.InboundTag, "add-client", credential); err != nil {
-				errs = append(errs, fmt.Errorf("%s: %w", s.Username, err))
-				continue
-			}
-		}
-		_ = e.repo.DeleteNodeTrafficSuspension(ctx, node.ID, s.Username, s.Kind)
+	if err := mutateInboundClient(ctx, e.remoteManage, server.ID, node.InboundTag, "add-client", credential); err != nil {
+		return err
 	}
-	return errors.Join(errs...)
+	return e.repo.DeletePackageNodeTrafficSuspension(ctx, user.Username, packageID, nodeID, "physical")
+}
+
+func mustListPackageNodeSuspensions(ctx context.Context, repo *storage.TrafficRepository) []storage.PackageNodeTrafficSuspension {
+	items, _ := repo.ListPackageNodeTrafficSuspensions(ctx)
+	return items
 }
 
 // CheckServerTrafficResets 是常规扫描与独立兜底任务共用的服务器重置入口。
@@ -635,6 +609,9 @@ func (e *TrafficLimitEnforcer) resumeUserRoutedAccess(ctx context.Context, user 
 		if node.RoutedOwner == "user" {
 			continue // 私有节点已由 resumeUserPrivateRouted 重建整条 rule。
 		}
+		if e.repo.HasPackageNodeTrafficSuspension(ctx, user.Username, sa.RoutedNodeID) {
+			continue
+		}
 		if err := addUserToRoutedNode(ctx, e.remoteManage, e.repo, user, sa.RoutedNodeID); err != nil {
 			// addUserToRoutedNode 的历史语义可能已把 DB 置 active 后才发现 routing
 			// 写入失败；恢复流程必须改回 inactive，给下一轮留下重试依据。
@@ -654,6 +631,9 @@ func (e *TrafficLimitEnforcer) restoreUserToInbounds(ctx context.Context, user s
 	}
 	ok := true
 	for _, cfg := range configs {
+		if e.repo.HasPhysicalPackageNodeTrafficSuspension(ctx, user.Username, cfg.ServerID, cfg.InboundTag) {
+			continue
+		}
 		if err := addUserToInbound(ctx, e.remoteManage, e.repo, user, cfg.ServerID, cfg.InboundTag); err != nil {
 			// Agent 明确确认 inbound 已不存在时，这条 DB 绑定已经是孤儿配置。
 			// 它不可能通过重试恢复；若继续把它算作失败，会让 is_over_limit 永远无法清除，

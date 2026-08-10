@@ -122,7 +122,7 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 				oldName, _ := proxyConfig["name"].(string)
 				applyPackageNameOverride(proxyConfig, node, pkg)
 				applyMultiplierPrefix(proxyConfig, node, pkg, &sysCfg)
-				applySharedNodeTrafficName(r.Context(), h.repo, node, proxyConfig)
+				applyPackageNodeTrafficName(r.Context(), h.repo, username, pkg, node, proxyConfig)
 				newName, _ := proxyConfig["name"].(string)
 				recordRename(oldName, newName, oldName != newName)
 				noteProxy(node, proxyConfig)
@@ -137,12 +137,11 @@ func (h *PackageSubscribeHandler) ServeHTTP(w http.ResponseWriter, r *http.Reque
 		if err := json.Unmarshal([]byte(node.ClashConfig), &proxyConfig); err != nil {
 			continue
 		}
-		applySharedNodeTrafficName(r.Context(), h.repo, node, proxyConfig)
 		applyUserCredentials(proxyConfig, node, credMap)
 		oldName, _ := proxyConfig["name"].(string)
 		applyPackageNameOverride(proxyConfig, node, pkg)
 		applyMultiplierPrefix(proxyConfig, node, pkg, &sysCfg)
-		applySharedNodeTrafficName(r.Context(), h.repo, node, proxyConfig)
+		applyPackageNodeTrafficName(r.Context(), h.repo, username, pkg, node, proxyConfig)
 		newName, _ := proxyConfig["name"].(string)
 		recordRename(oldName, newName, oldName != newName)
 		noteProxy(node, proxyConfig)

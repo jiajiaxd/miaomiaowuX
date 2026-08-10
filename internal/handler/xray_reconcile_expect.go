@@ -107,9 +107,6 @@ func computeUserExpectation(
 		if node.OriginalServer == "" {
 			continue
 		}
-		if node.TrafficExhausted {
-			continue // 节点共享额度用尽,由 enforcer 摘除且 reconciler 不得补回
-		}
 		sid, ok := serverIDByName[node.OriginalServer]
 		if !ok {
 			continue // server 已删/改名 → 跳过,不据此删 client

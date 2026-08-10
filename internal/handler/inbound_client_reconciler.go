@@ -230,7 +230,7 @@ func (c *InboundClientReconciler) runOnce(ctx context.Context) (string, error) {
 		return "", err
 	}
 	configs = slices.DeleteFunc(configs, func(cfg storage.UserInboundConfig) bool {
-		return c.repo.HasPhysicalNodeTrafficSuspension(ctx, cfg.Username, cfg.ServerID, cfg.InboundTag)
+		return c.repo.HasPhysicalPackageNodeTrafficSuspension(ctx, cfg.Username, cfg.ServerID, cfg.InboundTag)
 	})
 
 	servers, err := c.repo.ListRemoteServers(ctx)
