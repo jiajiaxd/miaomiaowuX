@@ -222,6 +222,14 @@ connection_mode: "auto"   # auto | websocket | http | pull
 <details>
 <summary>更新日志</summary>
 
+### v0.4.7-beta.6 (2026-08-10)
+- 🛠️ fix: 偶发前后端交互解密失败
+- 🛠️ fix: 保存套餐节点报错
+- 🛠️ fix: 编辑订阅错误自动修复
+- 🛠️ fix: 修改节点导致节点名称被覆盖
+- 🛠️ fix: 删除源节点的时候移除tunnel
+- 🛠️ fix: 节点连接数显示错误
+- 🌈 支持套餐单独设置节点流量
 ### v0.4.7-beta.5 (2026-08-10)
 - 🛠️ fix: openrc 重启失败
 - 🌈 支持各种问题引起的xray凭据错误修复
