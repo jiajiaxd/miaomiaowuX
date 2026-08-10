@@ -13,7 +13,7 @@ import (
 // webAppPage 返回 Mini App 单页(自包含,引 Telegram WebApp SDK)。
 // __DEVPREVIEW__ 注入:仅 webapp_dev_preview=true 时允许从 ?initData= 读取
 // 真实 Telegram 签名串。无签名时不得回退为管理员。
-// __THEME__ 注入:跟随主控「默认主题」,anime 时给 <html> 加 theme-anime 类(首屏即生效,无闪烁)。
+// __THEME__ 注入:跟随主控「默认主题」,为特殊主题注入根 class(首屏即生效,无闪烁)。
 func (s *Service) webAppPage(w http.ResponseWriter, r *http.Request) {
 	// Do not let a CDN retain an old Mini App shell after authorization fixes.
 	setWebAppPrivateHeaders(w)
@@ -23,8 +23,11 @@ func (s *Service) webAppPage(w http.ResponseWriter, r *http.Request) {
 		flag = "true"
 	}
 	themeClass := ""
-	if s.cachedDefaultTheme(r.Context()) == "anime" {
+	switch s.cachedDefaultTheme(r.Context()) {
+	case "anime":
 		themeClass = "theme-anime"
+	case "premium":
+		themeClass = "theme-premium"
 	}
 	html := strings.ReplaceAll(webAppHTML, "__DEVPREVIEW__", flag)
 	html = strings.ReplaceAll(html, "__THEME__", themeClass)
@@ -129,6 +132,10 @@ html.theme-anime .ax-p::after{color:#8b5cf6}
 /* anime 紫白棋盘格背景(同款主控 body),header/nav/输入框仍是实色浮在格子上 */
 html.theme-anime body{background-color:#faf8ff;background-image:repeating-conic-gradient(#f1ecfb 0 25%,#faf8ff 0 50%);background-size:88px 88px;background-attachment:fixed}
 html.dark.theme-anime body{background-color:#120e22;background-image:repeating-conic-gradient(#171130 0 25%,#120e22 0 50%);background-size:88px 88px;background-attachment:fixed}
+html.theme-premium{--brand:#d7a63d;--brand-soft:#292315;--bg:#080909;--text:#f4eedf;--card:#10110f;--muted:#a89f8b;--border:rgba(215,166,61,.32);color-scheme:dark}
+html.theme-premium body{background-color:#080909;background-image:linear-gradient(rgba(215,166,61,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(215,166,61,.025) 1px,transparent 1px);background-size:32px 32px;background-attachment:fixed}
+html.theme-premium .card{border-color:rgba(215,166,61,.32);border-radius:2px;background:#10110f;box-shadow:0 12px 32px -24px rgba(215,166,61,.65)}
+html.theme-premium .ax-t,html.theme-premium .ax-g{background:linear-gradient(110deg,#8c5d17,#f2d78a 45%,#c78e24 70%,#fff1b9);-webkit-background-clip:text;background-clip:text;color:transparent}
 /* anime 卡片:方角 + 蕾丝花纹内边框(照搬主控 .pixel-card::after)。
    ::after 用透明 border + border-image 画蕾丝;inset 4 + border 13 ≈ 17px,故内边距提到 18px 让内容避开花纹。 */
 html.theme-anime .card{position:relative;border:none;border-radius:0;padding:18px 16px;box-shadow:0 4px 18px -6px rgba(139,92,246,.28)}

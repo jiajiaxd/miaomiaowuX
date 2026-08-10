@@ -180,10 +180,20 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	showExpiry := h.setting(ctx, probeDisguiseShowExpiryKey)
 	showPrice := h.setting(ctx, probeDisguiseShowPriceKey)
 	showGlobe := h.setting(ctx, probeDisguiseShowGlobeKey)
+	showTraffic7D := func() bool { v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowTraffic7DKey); return v != "0" }()
+	showResourceHeatmap := func() bool {
+		v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowResourceHeatmapKey)
+		return v != "0"
+	}()
+	showTrafficQuota := func() bool { v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowTrafficQuotaKey); return v != "0" }()
+	showRenewalTimeline := func() bool {
+		v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowRenewalTimelineKey)
+		return v != "0"
+	}()
 	showReturnRoute := h.setting(ctx, probeDisguiseShowReturnRouteKey)
 	showExternalLicense := h.setting(ctx, probeDisguiseShowExternalLicenseKey)
 	var exchangeRates map[string]float64
-	if showPrice && h.licenseManager != nil {
+	if (showPrice || showRenewalTimeline) && h.licenseManager != nil {
 		rateCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		exchangeRates, _ = h.licenseManager.ExchangeRates(rateCtx)
 		cancel()
@@ -237,7 +247,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 			up, down := s.CurrentUploadSpeed, s.CurrentDownloadSpeed
 			ps.UploadSpeed, ps.DownloadSpeed = &up, &down
 		}
-		if showExpiry {
+		if showExpiry || showRenewalTimeline {
 			ps.ProviderName, ps.ProviderURL = s.ProviderName, safeProviderURL(s.ProviderURL)
 			if s.ExpiresAt != nil {
 				ps.ExpiresAt = s.ExpiresAt.Format("2006-01-02")
@@ -245,7 +255,7 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 				ps.ExpiresAt = nextResetDate(time.Now().UTC(), s.TrafficResetDay).Format("2006-01-02")
 			}
 		}
-		if showPrice && s.RenewalPrice > 0 {
+		if (showPrice || showRenewalTimeline) && s.RenewalPrice > 0 {
 			price := s.RenewalPrice
 			ps.RenewalPrice, ps.RenewalCycle, ps.RenewalCurrency = &price, s.RenewalCycle, s.RenewalCurrency
 			if rate, ok := exchangeRates[strings.ToUpper(strings.TrimSpace(s.RenewalCurrency))]; ok && rate > 0 {
@@ -253,20 +263,25 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 				ps.RenewalPriceCNY = &cny
 			}
 		}
-		if onTraffic {
+		if onTraffic || showTraffic7D || showTrafficQuota {
 			tu, tl := used, s.TrafficLimit
 			ps.TrafficUsed, ps.TrafficLimit = &tu, &tl
+			periodStart := ""
+			if start, end, ok := serverTrafficPeriod(time.Now(), s.TrafficResetDay); ok {
+				periodStart = start.Format("2006-01-02")
+				ps.PeriodStart = periodStart
+				ps.PeriodEnd = end.Format("2006-01-02")
+			}
 			var periodUp, periodDown int64
 			for _, day := range ps.DailyTraffic {
+				if periodStart != "" && day.Date < periodStart {
+					continue
+				}
 				periodUp += day.Uplink
 				periodDown += day.Downlink
 			}
 			periodTotal := periodUp + periodDown
 			ps.TrafficUsedUp, ps.TrafficUsedDown, ps.TrafficUsedTotal = &periodUp, &periodDown, &periodTotal
-			if start, end, ok := serverTrafficPeriod(time.Now(), s.TrafficResetDay); ok {
-				ps.PeriodStart = start.Format("2006-01-02")
-				ps.PeriodEnd = end.Format("2006-01-02")
-			}
 			// 累计上下行:仅 system-source 服务器有 rx/tx cycle;>0 才带(前端据此显示"已用上下行"行)。
 			if s.SystemTxCycle > 0 || s.SystemRxCycle > 0 {
 				up, down := s.SystemTxCycle, s.SystemRxCycle
@@ -310,10 +325,14 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 			"color_mode": "light",
 			"revision":   theme,
 		},
-		"block_login": blockLogin == "1",
-		"show_name":   showName,
-		"show_globe":  showGlobe,
-		"servers":     out,
+		"block_login":           blockLogin == "1",
+		"show_name":             showName,
+		"show_globe":            showGlobe,
+		"show_traffic_7d":       showTraffic7D,
+		"show_resource_heatmap": showResourceHeatmap,
+		"show_traffic_quota":    showTrafficQuota,
+		"show_renewal_timeline": showRenewalTimeline,
+		"servers":               out,
 	}
 	if showExternalLicense && h.licenseManager != nil {
 		status := h.licenseManager.GetStatus()
@@ -367,9 +386,12 @@ func (h *ProbePublicHandler) loadDailyTraffic(ctx context.Context, servers []sto
 	out := make(map[int64][]probeDailyTraffic, len(servers))
 	for _, server := range servers {
 		serverID, byDate := server.ID, values[server.ID]
-		start := now.AddDate(0, 0, -(queryDays - 1))
+		// 图表至少需要最近 7 个自然日；计费周期更早时继续保留完整周期。
+		start := dayStart(now).AddDate(0, 0, -6)
 		if server.TrafficResetDay >= 1 && server.TrafficResetDay <= 31 {
-			start = prevResetDate(now, server.TrafficResetDay)
+			if cycleStart := prevResetDate(now, server.TrafficResetDay); cycleStart.Before(start) {
+				start = cycleStart
+			}
 		}
 		days := int(dayStart(now).Sub(dayStart(start)).Hours()/24) + 1
 		list := make([]probeDailyTraffic, 0, days)

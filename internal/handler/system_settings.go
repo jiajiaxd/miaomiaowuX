@@ -350,6 +350,10 @@ const (
 	probeDisguiseShowExpiryKey          = "probe_disguise_show_expiry"
 	probeDisguiseShowPriceKey           = "probe_disguise_show_price"
 	probeDisguiseShowGlobeKey           = "probe_disguise_show_globe"
+	probeDisguiseShowTraffic7DKey       = "probe_disguise_show_traffic_7d"
+	probeDisguiseShowResourceHeatmapKey = "probe_disguise_show_resource_heatmap"
+	probeDisguiseShowTrafficQuotaKey    = "probe_disguise_show_traffic_quota"
+	probeDisguiseShowRenewalTimelineKey = "probe_disguise_show_renewal_timeline"
 	probeDisguiseShowReturnRouteKey     = "probe_disguise_show_return_route"
 	probeDisguiseShowExternalLicenseKey = "probe_disguise_show_external_license"
 	probeDisguisePingTargetsKey         = "probe_disguise_ping_targets" // JSON [{key,label,isp,host,port}]
@@ -423,6 +427,10 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	showExpiry, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowExpiryKey)
 	showPrice, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowPriceKey)
 	showGlobe, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowGlobeKey)
+	showTraffic7D, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowTraffic7DKey)
+	showResourceHeatmap, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowResourceHeatmapKey)
+	showTrafficQuota, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowTrafficQuotaKey)
+	showRenewalTimeline, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowRenewalTimelineKey)
 	showReturnRoute, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowReturnRouteKey)
 	showExternalLicense, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowExternalLicenseKey)
 	pingTargetsRaw, _ := h.repo.GetSystemSetting(ctx, probeDisguisePingTargetsKey)
@@ -466,6 +474,10 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 		"show_expiry":               showExpiry == "1",
 		"show_price":                showPrice == "1",
 		"show_globe":                showGlobe == "1",
+		"show_traffic_7d":           showTraffic7D != "0",
+		"show_resource_heatmap":     showResourceHeatmap != "0",
+		"show_traffic_quota":        showTrafficQuota != "0",
+		"show_renewal_timeline":     showRenewalTimeline != "0",
 		"show_return_route":         showReturnRoute == "1",
 		"show_external_license":     showExternalLicense == "1",
 		"ping_targets":              pingTargets,
@@ -501,6 +513,10 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		ShowExpiry          *bool              `json:"show_expiry"`
 		ShowPrice           *bool              `json:"show_price"`
 		ShowGlobe           *bool              `json:"show_globe"`
+		ShowTraffic7D       *bool              `json:"show_traffic_7d"`
+		ShowResourceHeatmap *bool              `json:"show_resource_heatmap"`
+		ShowTrafficQuota    *bool              `json:"show_traffic_quota"`
+		ShowRenewalTimeline *bool              `json:"show_renewal_timeline"`
 		ShowReturnRoute     *bool              `json:"show_return_route"`
 		ShowExternalLicense *bool              `json:"show_external_license"`
 		PingTargets         *[]ProbePingTarget `json:"ping_targets"`
@@ -683,7 +699,11 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		return h.repo.SetSystemSetting(ctx, key, v) == nil
 	}
 	if !setDisplayPtr(probeDisguiseMetricTrafficKey, req.MetricTraffic) ||
-		!setDisplayPtr(probeDisguiseMetricSpeedKey, req.MetricSpeed) {
+		!setDisplayPtr(probeDisguiseMetricSpeedKey, req.MetricSpeed) ||
+		!setDisplayPtr(probeDisguiseShowTraffic7DKey, req.ShowTraffic7D) ||
+		!setDisplayPtr(probeDisguiseShowResourceHeatmapKey, req.ShowResourceHeatmap) ||
+		!setDisplayPtr(probeDisguiseShowTrafficQuotaKey, req.ShowTrafficQuota) ||
+		!setDisplayPtr(probeDisguiseShowRenewalTimelineKey, req.ShowRenewalTimeline) {
 		fail()
 		return
 	}
@@ -1190,13 +1210,13 @@ func (h *SystemSettingsHandler) SetSubscriptionOutputFormat(w http.ResponseWrite
 	json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "订阅序列化格式已更新"})
 }
 
-// DefaultThemeKey 是「默认主题」系统设置的 KV 键。值:"flat"(扁平)/ "pixel"(妙妙屋像素风,默认)。
+// DefaultThemeKey 是「默认主题」系统设置的 KV 键。支持 flat / pixel / anime / premium。
 // 无 mmw-theme-style cookie 的用户首屏用它决定初始主题(由 web.SetDefaultTheme 注入 index.html)。
 const DefaultThemeKey = "default_theme"
 
 func (h *SystemSettingsHandler) GetDefaultTheme(w http.ResponseWriter, r *http.Request) {
 	value, _ := h.repo.GetSystemSetting(r.Context(), DefaultThemeKey)
-	if value != "flat" && value != "pixel" && value != "anime" {
+	if value != "flat" && value != "pixel" && value != "anime" && value != "premium" {
 		value = "pixel"
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1213,10 +1233,10 @@ func (h *SystemSettingsHandler) SetDefaultTheme(w http.ResponseWriter, r *http.R
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "请求格式错误"})
 		return
 	}
-	if req.DefaultTheme != "flat" && req.DefaultTheme != "pixel" && req.DefaultTheme != "anime" {
+	if req.DefaultTheme != "flat" && req.DefaultTheme != "pixel" && req.DefaultTheme != "anime" && req.DefaultTheme != "premium" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "主题必须为 flat / pixel / anime"})
+		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "主题必须为 flat / pixel / anime / premium"})
 		return
 	}
 	if err := h.repo.SetSystemSetting(r.Context(), DefaultThemeKey, req.DefaultTheme); err != nil {

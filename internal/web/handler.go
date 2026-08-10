@@ -21,7 +21,7 @@ import (
 var embeddedFiles embed.FS
 
 // themePlaceholder 是 index.html 内联脚本里的默认主题占位符,serveIndex 时替换成管理员设置的值。
-// 无 cookie 的用户首屏据此决定初始主题(flat / pixel),避免像素↔扁平的加载闪烁。
+// 无 cookie 的用户首屏据此决定初始主题(flat / pixel / anime / premium),避免主题加载闪烁。
 const themePlaceholder = "__MMW_DEFAULT_THEME__"
 
 var (
@@ -36,11 +36,11 @@ var (
 	currentTheme = "pixel"
 )
 
-// SetDefaultTheme 更新首屏注入的默认主题(flat / pixel),供无 mmw-theme-style cookie 的用户决定初始主题。
+// SetDefaultTheme 更新首屏注入的默认主题,供无 mmw-theme-style cookie 的用户决定初始主题。
 // 由 main.go 启动时按 DB 设置调用一次,并在管理员改主题时同步调用。
 func SetDefaultTheme(theme string) {
 	initOnce.Do(initialize)
-	if theme != "flat" && theme != "pixel" && theme != "anime" {
+	if theme != "flat" && theme != "pixel" && theme != "anime" && theme != "premium" {
 		theme = "pixel"
 	}
 	themeMu.Lock()

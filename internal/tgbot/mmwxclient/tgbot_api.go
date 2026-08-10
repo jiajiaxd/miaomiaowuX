@@ -599,7 +599,7 @@ func (c *Client) AssignPackage(ctx context.Context, username string, packageID i
 		map[string]any{"username": username, "package_id": packageID}, nil)
 }
 
-// GetDefaultTheme 取主控「默认主题」系统设置(flat / pixel / anime)。端点 RequireAdmin,bot token 可访问。
+// GetDefaultTheme 取主控「默认主题」系统设置(flat / pixel / anime / premium)。端点 RequireAdmin,bot token 可访问。
 // 供 Mini App 跟随主控主题使用;失败时上层自行退化为默认(pixel)。
 func (c *Client) GetDefaultTheme(ctx context.Context) (string, error) {
 	var out struct {
