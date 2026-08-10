@@ -51,13 +51,32 @@ func parseLevel(s string) slog.Level {
 // remote_ws / collector 这些最需要排障的地方）。直接 log.SetOutput 又会让文件里混进
 // 标准库自带的 "2009/11/10 23:00:00" 时间戳格式，解析器得兼容两套 —— 故在此统一成 logfmt。
 //
-// 标准库 log 没有级别概念，一律记为 INFO（它们本来也从来没有级别）。
+// 标准库 log 没有级别概念。历史调用点通常用 Failed/失败、SQLSTATE 等明确表达错误，
+// 适配时识别这些稳定标记，避免数据库 ERROR 被错误写成 INFO 而无法按级别筛选。
 type stdlogAdapter struct{ w io.Writer }
+
+func inferStdLogLevel(msg string) string {
+	upper := strings.ToUpper(msg)
+	lower := strings.ToLower(msg)
+	if strings.Contains(upper, "SQLSTATE ") ||
+		strings.Contains(upper, "ERROR:") ||
+		strings.Contains(lower, "failed to ") ||
+		strings.Contains(msg, "失败") ||
+		strings.Contains(lower, "database disk image is malformed") ||
+		strings.Contains(lower, "database is locked") ||
+		strings.Contains(lower, "disk i/o error") {
+		return "ERROR"
+	}
+	if strings.Contains(upper, "WARNING:") || strings.Contains(lower, " warning") || strings.Contains(msg, "警告") {
+		return "WARN "
+	}
+	return "INFO "
+}
 
 func (a stdlogAdapter) Write(p []byte) (int, error) {
 	msg := strings.TrimRight(string(p), "\n")
 	line := fmt.Sprintf("time=%q level=%q msg=%q\n",
-		time.Now().Format("2006-01-02 15:04:05"), "INFO ", msg)
+		time.Now().Format("2006-01-02 15:04:05"), inferStdLogLevel(msg), msg)
 	if _, err := a.w.Write([]byte(line)); err != nil {
 		return 0, err
 	}

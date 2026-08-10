@@ -16,7 +16,91 @@ func typedValueGroups(rows int, types ...string) string {
 	return strings.TrimSuffix(strings.Repeat(group+",", rows), ",")
 }
 
+// PostgreSQL rejects INSERT ... ON CONFLICT DO UPDATE when the same target key
+// appears more than once in a VALUES list (SQLSTATE 21000). Xray counters are
+// cumulative, so duplicate rows for the same key must be collapsed with max,
+// never summed, before delta calculation.
+func normalizeNodeTrafficItems(items []NodeTrafficItem) []NodeTrafficItem {
+	byKey := make(map[string]NodeTrafficItem, len(items))
+	for _, item := range items {
+		if item.Tag == "" || item.Type != "inbound" && item.Type != "outbound" {
+			continue
+		}
+		key := item.Tag + "\x00" + item.Type
+		if old, ok := byKey[key]; ok {
+			if old.Uplink > item.Uplink {
+				item.Uplink = old.Uplink
+			}
+			if old.Downlink > item.Downlink {
+				item.Downlink = old.Downlink
+			}
+		}
+		byKey[key] = item
+	}
+	result := make([]NodeTrafficItem, 0, len(byKey))
+	for _, item := range byKey {
+		result = append(result, item)
+	}
+	return result
+}
+
+func normalizeEmailTrafficItems(items []UserEmailTrafficUpsert) []UserEmailTrafficUpsert {
+	byKey := make(map[string]UserEmailTrafficUpsert, len(items))
+	for _, item := range items {
+		if item.Email == "" {
+			continue
+		}
+		if old, ok := byKey[item.Email]; ok {
+			if old.Uplink > item.Uplink {
+				item.Uplink = old.Uplink
+			}
+			if old.Downlink > item.Downlink {
+				item.Downlink = old.Downlink
+			}
+			if item.AttributedUsername == "" {
+				item.AttributedUsername = old.AttributedUsername
+			}
+			if item.Weight <= 0 {
+				item.Weight = old.Weight
+			}
+			if len(item.NodeShares) == 0 {
+				item.NodeShares = old.NodeShares
+			}
+		}
+		byKey[item.Email] = item
+	}
+	result := make([]UserEmailTrafficUpsert, 0, len(byKey))
+	for _, item := range byKey {
+		result = append(result, item)
+	}
+	return result
+}
+
+func normalizeUserTrafficItems(items []UserTrafficUpsert) []UserTrafficUpsert {
+	byKey := make(map[string]UserTrafficUpsert, len(items))
+	for _, item := range items {
+		if item.Username == "" {
+			continue
+		}
+		if old, ok := byKey[item.Username]; ok {
+			if old.Uplink > item.Uplink {
+				item.Uplink = old.Uplink
+			}
+			if old.Downlink > item.Downlink {
+				item.Downlink = old.Downlink
+			}
+		}
+		byKey[item.Username] = item
+	}
+	result := make([]UserTrafficUpsert, 0, len(byKey))
+	for _, item := range byKey {
+		result = append(result, item)
+	}
+	return result
+}
+
 func (r *TrafficRepository) upsertNodeTrafficBatchPostgres(ctx context.Context, serverID int64, items []NodeTrafficItem, restarted bool) error {
+	items = normalizeNodeTrafficItems(items)
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -117,7 +201,26 @@ func (r *TrafficRepository) upsertTrafficBatchPostgres(ctx context.Context, serv
 
 type trafficOld struct{ id, totalUp, totalDown, lastUp, lastDown int64 }
 
+type postgresUserNodeDelta struct {
+	nodeID                             int64
+	username                           string
+	up, down, weightedUp, weightedDown float64
+}
+
+func addPostgresUserNodeDelta(byKey map[string]postgresUserNodeDelta, incoming postgresUserNodeDelta) {
+	key := fmt.Sprintf("%d\x00%s", incoming.nodeID, incoming.username)
+	delta := byKey[key]
+	delta.nodeID = incoming.nodeID
+	delta.username = incoming.username
+	delta.up += incoming.up
+	delta.down += incoming.down
+	delta.weightedUp += incoming.weightedUp
+	delta.weightedDown += incoming.weightedDown
+	byKey[key] = delta
+}
+
 func batchEmailTrafficPostgres(ctx context.Context, tx *dialectTx, serverID int64, items []UserEmailTrafficUpsert, restarted bool) error {
+	items = normalizeEmailTrafficItems(items)
 	if len(items) == 0 {
 		return nil
 	}
@@ -199,12 +302,7 @@ func batchEmailTrafficPostgres(ctx context.Context, tx *dialectTx, serverID int6
 		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 			return err
 		}
-		type userNodeDelta struct {
-			nodeID                             int64
-			username                           string
-			up, down, weightedUp, weightedDown float64
-		}
-		var userNodes []userNodeDelta
+		userNodesByKey := make(map[string]postgresUserNodeDelta)
 		for _, d := range ledger {
 			if d.username == "" {
 				continue
@@ -221,8 +319,19 @@ func batchEmailTrafficPostgres(ctx context.Context, tx *dialectTx, serverID int6
 				if raw <= 0 {
 					raw = 1
 				}
-				userNodes = append(userNodes, userNodeDelta{share.NodeID, d.username, float64(d.up) * raw, float64(d.down) * raw, float64(d.up) * share.Weight, float64(d.down) * share.Weight})
+				addPostgresUserNodeDelta(userNodesByKey, postgresUserNodeDelta{
+					nodeID:       share.NodeID,
+					username:     d.username,
+					up:           float64(d.up) * raw,
+					down:         float64(d.down) * raw,
+					weightedUp:   float64(d.up) * share.Weight,
+					weightedDown: float64(d.down) * share.Weight,
+				})
 			}
+		}
+		userNodes := make([]postgresUserNodeDelta, 0, len(userNodesByKey))
+		for _, delta := range userNodesByKey {
+			userNodes = append(userNodes, delta)
 		}
 		if len(userNodes) > 0 {
 			args := make([]any, 0, len(userNodes)*8)
@@ -239,6 +348,7 @@ func batchEmailTrafficPostgres(ctx context.Context, tx *dialectTx, serverID int6
 }
 
 func batchUserTrafficPostgres(ctx context.Context, tx *dialectTx, serverID int64, items []UserTrafficUpsert, restarted bool) error {
+	items = normalizeUserTrafficItems(items)
 	if len(items) == 0 {
 		return nil
 	}

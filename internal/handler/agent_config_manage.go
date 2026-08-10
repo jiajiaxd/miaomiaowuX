@@ -125,6 +125,47 @@ type RemoteServerInboundInfo struct {
 	Downlink int64  `json:"downlink"`
 }
 
+// currentInboundInfos 只以服务器 current Xray 配置决定“当前存在的入站”。
+// node_traffic 是永久累计账本，删除入站后仍会保留历史行，绝不能反过来当入站清单使用。
+func currentInboundInfos(configJSON string, trafficRows []storage.NodeTraffic) []RemoteServerInboundInfo {
+	var cfg struct {
+		Inbounds []struct {
+			Tag      string `json:"tag"`
+			Protocol string `json:"protocol"`
+			Port     int    `json:"port"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		return []RemoteServerInboundInfo{}
+	}
+	trafficByTag := make(map[string]storage.NodeTraffic, len(trafficRows))
+	for _, row := range trafficRows {
+		if row.Type == "inbound" {
+			trafficByTag[row.Tag] = row
+		}
+	}
+	result := make([]RemoteServerInboundInfo, 0, len(cfg.Inbounds))
+	seen := make(map[string]struct{}, len(cfg.Inbounds))
+	for _, inbound := range cfg.Inbounds {
+		inbound.Tag = strings.TrimSpace(inbound.Tag)
+		inbound.Protocol = strings.TrimSpace(inbound.Protocol)
+		if inbound.Tag == "" || inbound.Tag == "api" || inbound.Protocol == "" || inbound.Port <= 0 {
+			continue
+		}
+		if _, ok := seen[inbound.Tag]; ok {
+			continue
+		}
+		seen[inbound.Tag] = struct{}{}
+		info := RemoteServerInboundInfo{Tag: inbound.Tag, Protocol: inbound.Protocol, Port: inbound.Port}
+		if row, ok := trafficByTag[inbound.Tag]; ok {
+			info.Uplink = row.TotalUplink
+			info.Downlink = row.TotalDownlink
+		}
+		result = append(result, info)
+	}
+	return result
+}
+
 // RemoteServerExtended 表示具有附加流量和入站信息的远程服务器
 type RemoteServerExtended struct {
 	storage.RemoteServer
@@ -266,19 +307,10 @@ func (h *XrayServerHandler) BuildRemoteServersList(ctx context.Context) RemoteSe
 		trafficUsed, _ := h.repo.GetServerTrafficUsed(ctx, server.ID)
 		extended.TrafficUsed = trafficUsed + server.TrafficUsedOffset
 
-		nodeTraffic, err := h.repo.GetNodeTrafficByServer(ctx, server.ID)
-		if err == nil {
-			for _, nt := range nodeTraffic {
-				if nt.Type == "inbound" && nt.Tag != "api" {
-					extended.Inbounds = append(extended.Inbounds, RemoteServerInboundInfo{
-						Tag:      nt.Tag,
-						Protocol: "",
-						Port:     0,
-						Uplink:   nt.TotalUplink,
-						Downlink: nt.TotalDownlink,
-					})
-				}
-			}
+		nodeTraffic, trafficErr := h.repo.GetNodeTrafficByServer(ctx, server.ID)
+		currentSnapshot, snapshotErr := h.repo.GetCurrentXraySnapshot(ctx, server.ID)
+		if trafficErr == nil && snapshotErr == nil && currentSnapshot != nil {
+			extended.Inbounds = currentInboundInfos(currentSnapshot.ConfigJSON, nodeTraffic)
 		}
 
 		// 列表不再明文回传令牌(Encrypted/WsConnected 已在上面用原始 server.Token 算好)。
