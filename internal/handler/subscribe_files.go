@@ -91,9 +91,7 @@ func (h *subscribeFilesHandler) handleList(w http.ResponseWriter, r *http.Reques
 
 	// 数据隔离:
 	//   - 普通用户:只看自己创建的
-	//   - admin:看 created_by="" / created_by=自己 / created_by 是另一个 admin。
-	//     普通用户通过"生成订阅"创建的私有订阅对 admin 不可见(避免泄露其他用户的私订阅)。
-	//   注:这里只过滤"列表"。admin 仍可通过 GET/PUT/DELETE 路径直接拿订阅 ID 操作,后台清理 / 帮用户排错时需要。
+	//   - admin:查看全部订阅,前端可按 created_by 筛选,便于代用户排错和管理。
 	username := auth.UsernameFromContext(ctx)
 	isAdmin := userIsAdmin(ctx, h.repo, username)
 	if !isAdmin {
@@ -104,8 +102,6 @@ func (h *subscribeFilesHandler) handleList(w http.ResponseWriter, r *http.Reques
 			}
 		}
 		files = filtered
-	} else {
-		files = filterAdminVisibleSubscribeFiles(ctx, h.repo, files, username)
 	}
 
 	respondJSON(w, http.StatusOK, map[string]any{
@@ -1526,41 +1522,4 @@ func (h *subscribeFilesHandler) handleGetSubscriptionUsers(w http.ResponseWriter
 	}
 
 	respondJSON(w, http.StatusOK, map[string]any{"users": users})
-}
-
-// filterAdminVisibleSubscribeFiles 给 admin 视角的 handleList 用 — 隐藏掉普通用户私创的订阅文件。
-// 实现:对所有 distinct created_by 一次性查 role,O(distinct creators) 次 GetUser,避免每条订阅 N+1。
-//   - created_by 空 → 保留(无主历史数据)
-//   - created_by == self(当前 admin) → 保留
-//   - created_by 是另一个 admin → 保留(admin 之间互见)
-//   - created_by 是普通用户 → 隐藏(该用户私创的"生成订阅",不应被其他 admin 看到)
-func filterAdminVisibleSubscribeFiles(ctx context.Context, repo *storage.TrafficRepository, files []storage.SubscribeFile, self string) []storage.SubscribeFile {
-	if len(files) == 0 {
-		return files
-	}
-	creators := map[string]struct{}{}
-	for _, f := range files {
-		if f.CreatedBy != "" && f.CreatedBy != self {
-			creators[f.CreatedBy] = struct{}{}
-		}
-	}
-	// adminVisible:归属为「其他 admin」或「本实例已不存在的用户」的订阅,都让当前 admin 可见。
-	// 后者是跨实例迁移/恢复留下的孤儿订阅(created_by 是源实例用户名,本实例查不到)——
-	// 否则 admin 既看不到也删不掉,只能卡在列表外。规则用户(存在的非 admin)的私有订阅仍隐藏。
-	adminVisible := make(map[string]bool, len(creators))
-	for c := range creators {
-		u, err := repo.GetUser(ctx, c)
-		if err != nil {
-			adminVisible[c] = true // 归属用户不存在 → 孤儿订阅,admin 可管理/清理
-		} else if u.Role == storage.RoleAdmin {
-			adminVisible[c] = true
-		}
-	}
-	out := make([]storage.SubscribeFile, 0, len(files))
-	for _, f := range files {
-		if f.CreatedBy == "" || f.CreatedBy == self || adminVisible[f.CreatedBy] {
-			out = append(out, f)
-		}
-	}
-	return out
 }

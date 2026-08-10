@@ -286,7 +286,7 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 			node, err := h.repo.GetNodeByID(ctx, nodeID)
 			if err != nil {
 				rollbackReservations()
-				return err
+				return fmt.Errorf("读取新增节点 %d: %w", nodeID, err)
 			}
 			if node.NodeType == "routed" {
 				before, _ := h.repo.GetUserSubaccount(ctx, node.ID, user.Username)
@@ -309,7 +309,7 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 				}
 				if err != nil {
 					rollbackReservations()
-					return err
+					return fmt.Errorf("添加用户 %s 到路由节点 %s: %w", user.Username, node.NodeName, err)
 				}
 				continue
 			}
@@ -322,18 +322,18 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 			state, err := loadPackageServerConfig(ctx, h.remoteManage, states, server.ID)
 			if err != nil {
 				rollbackReservations()
-				return err
+				return fmt.Errorf("添加用户 %s 到节点 %s: %w", user.Username, node.NodeName, err)
 			}
 			_, settings, protocol, err := managedInbound(state.config, node.InboundTag)
 			if err != nil {
 				rollbackReservations()
-				return err
+				return fmt.Errorf("读取节点 %s 的入站 %s: %w", node.NodeName, node.InboundTag, err)
 			}
 			existing, _ := h.repo.GetUserInboundConfig(ctx, user.Username, server.ID, node.InboundTag)
 			credential, credentialJSON, _, err := getOrCreateInboundCredential(ctx, h.repo, user, server.ID, node.InboundTag, protocol, settings)
 			if err != nil {
 				rollbackReservations()
-				return err
+				return fmt.Errorf("生成用户 %s 在节点 %s 的凭据: %w", user.Username, node.NodeName, err)
 			}
 			// getOrCreate historically tolerated a failed reservation write. A
 			// coordinated operation cannot do that: the Agent config and the
@@ -352,7 +352,7 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 			}
 			if err := upsertManagedClient(state.config, node.InboundTag, credential); err != nil {
 				rollbackReservations()
-				return err
+				return fmt.Errorf("写入用户 %s 到节点 %s 的 Xray 配置: %w", user.Username, node.NodeName, err)
 			}
 		}
 
@@ -360,7 +360,7 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 			node, err := h.repo.GetNodeByID(ctx, nodeID)
 			if err != nil {
 				rollbackReservations()
-				return err
+				return fmt.Errorf("读取移除节点 %d: %w", nodeID, err)
 			}
 			if node.NodeType == "routed" {
 				subaccount, err := h.repo.GetUserSubaccount(ctx, node.ID, user.Username)
@@ -370,12 +370,12 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 				detail, err := h.repo.GetRoutedNodeDetail(ctx, node.ID)
 				if err != nil {
 					rollbackReservations()
-					return err
+					return fmt.Errorf("读取路由节点 %s 配置: %w", node.NodeName, err)
 				}
 				server, err := h.repo.GetRemoteServerByName(ctx, detail.OriginalServer)
 				if err != nil {
 					rollbackReservations()
-					return err
+					return fmt.Errorf("查找路由节点 %s 所在服务器: %w", node.NodeName, err)
 				}
 				state, err := loadPackageServerConfig(ctx, h.remoteManage, states, server.ID)
 				if err == nil {
@@ -386,7 +386,7 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 				}
 				if err != nil {
 					rollbackReservations()
-					return err
+					return fmt.Errorf("从路由节点 %s 移除用户 %s: %w", node.NodeName, user.Username, err)
 				}
 				delta.routedBefore[fmt.Sprintf("%s|%d", user.Username, node.ID)] = routedActiveBefore{id: subaccount.ID, active: true}
 				continue
@@ -403,7 +403,7 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 			state, err := loadPackageServerConfig(ctx, h.remoteManage, states, server.ID)
 			if err != nil {
 				rollbackReservations()
-				return err
+				return fmt.Errorf("从节点 %s 移除用户 %s: %w", node.NodeName, user.Username, err)
 			}
 			cfg, _ := h.repo.GetUserInboundConfig(ctx, user.Username, server.ID, node.InboundTag)
 			email := user.Username + "__" + node.InboundTag
@@ -419,7 +419,7 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 			}
 			if err := removeManagedClient(state.config, node.InboundTag, email, savedCredential); err != nil {
 				rollbackReservations()
-				return err
+				return fmt.Errorf("从节点 %s 的 Xray 配置移除用户 %s: %w", node.NodeName, user.Username, err)
 			}
 		}
 	}
@@ -428,12 +428,12 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 	for serverID, state := range states {
 		if err := validateManagedConfig(state.config); err != nil {
 			rollbackReservations()
-			return err
+			return fmt.Errorf("校验服务器 %d Xray 配置: %w", serverID, err)
 		}
 		configJSON, err := json.MarshalIndent(state.config, "", "  ")
 		if err != nil {
 			rollbackReservations()
-			return err
+			return fmt.Errorf("序列化服务器 %d Xray 配置: %w", serverID, err)
 		}
 		targets = append(targets, xrayConfigTransactionTarget{ServerID: serverID, Config: string(configJSON)})
 	}

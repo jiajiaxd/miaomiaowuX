@@ -449,6 +449,7 @@ func (h *PackageUpdateHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 				rollbackWarnings = append(rollbackWarnings, "恢复旧套餐数据库配置失败: "+err.Error())
 			}
 		}
+		log.Printf("[PackageUpdate] package_id=%d node sync failed (database rollback warnings=%d): %v", req.ID, len(rollbackWarnings), syncErr)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
