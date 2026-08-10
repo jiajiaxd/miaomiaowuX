@@ -1330,7 +1330,7 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// 转换为 map 进行基本校验（只检查错误，不做修复）
+	// 转换为 map 进行校验；可安全修复的问题由后端兜底处理，避免旧前端或直接 API 调用无法保存。
 	var yamlCheck map[string]any
 	if err := yaml.Unmarshal([]byte(req.Content), &yamlCheck); err != nil {
 		writeError(w, http.StatusBadRequest, errors.New("内容不是有效的YAML格式: "+err.Error()))
@@ -1356,8 +1356,16 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// 直接保存前端发送的内容（已经过前端修复，保持字段顺序）
+	// 没有修复时保留用户原始排版；发生修复时保存校验器产出的可用配置。
 	contentToSave := RemoveUnicodeEscapeQuotes(req.Content)
+	if validationResult.FixedConfig != nil {
+		fixedYAML, marshalErr := yaml.Marshal(validationResult.FixedConfig)
+		if marshalErr != nil {
+			writeError(w, http.StatusInternalServerError, errors.New("序列化自动修复后的配置失败"))
+			return
+		}
+		contentToSave = RemoveUnicodeEscapeQuotes(string(fixedYAML))
+	}
 
 	// 记录警告信息（如果有）
 	for _, issue := range validationResult.Issues {
@@ -1395,8 +1403,9 @@ func (h *subscribeFilesHandler) handleUpdateContent(w http.ResponseWriter, r *ht
 	}
 
 	respondJSON(w, http.StatusOK, map[string]any{
-		"status":  "updated",
-		"version": version,
+		"status":        "updated",
+		"version":       version,
+		"auto_repaired": validationResult.FixedConfig != nil,
 	})
 }
 

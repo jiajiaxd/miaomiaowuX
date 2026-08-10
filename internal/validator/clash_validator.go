@@ -60,9 +60,9 @@ func ValidateClashConfig(config map[string]interface{}) *ValidationResult {
 		}
 	}
 
-	// 3. 检测循环引用
+	// 3. 修复循环引用。保留代理组和节点顺序，只移除形成环的那条引用。
 	if groups, ok := fixedConfig["proxy-groups"].([]interface{}); ok {
-		circularIssues := detectCircularReferences(groups)
+		circularIssues := repairCircularReferences(groups)
 		result.Issues = append(result.Issues, circularIssues...)
 	}
 
@@ -197,10 +197,13 @@ func validateProxyGroups(groups []interface{}, proxies []interface{}) *GroupVali
 
 	seenNames := make(map[string]bool)
 	specialNodes := map[string]bool{
-		"DIRECT": true,
-		"REJECT": true,
-		"PROXY":  true,
-		"PASS":   true,
+		"DIRECT":      true,
+		"REJECT":      true,
+		"REJECT-DROP": true,
+		"PROXY":       true,
+		"PASS":        true,
+		"GLOBAL":      true,
+		"COMPATIBLE":  true,
 	}
 
 	// 常见拼写错误修正
@@ -273,12 +276,14 @@ func validateProxyGroups(groups []interface{}, proxies []interface{}) *GroupVali
 
 		if !hasValidProxies && !hasValidUse && !hasValidFilter && !hasValidIncludeAll {
 			result.Issues = append(result.Issues, ValidationIssue{
-				Level:    ErrorLevel,
-				Message:  fmt.Sprintf("代理组 \"%s\" 的proxies、use、filter和include-all字段都为空或不存在", name),
-				Location: fmt.Sprintf("proxy-groups[%d]", i),
-				Field:    "proxies",
+				Level:     WarningLevel,
+				Message:   fmt.Sprintf("代理组 \"%s\" 没有可用节点，已自动添加 DIRECT", name),
+				Location:  fmt.Sprintf("proxy-groups[%d]", i),
+				Field:     "proxies",
+				AutoFixed: true,
 			})
-			continue
+			groupProxies = []interface{}{"DIRECT"}
+			hasValidProxies = true
 		}
 
 		// 校验proxies引用
@@ -319,10 +324,11 @@ func validateProxyGroups(groups []interface{}, proxies []interface{}) *GroupVali
 
 				if !isSpecial && !isProxy && !isGroup {
 					result.Issues = append(result.Issues, ValidationIssue{
-						Level:    ErrorLevel,
-						Message:  fmt.Sprintf("代理组 \"%s\" 引用了不存在的节点: \"%s\"", name, correctedName),
-						Location: fmt.Sprintf("proxy-groups[%d]", i),
-						Field:    "proxies",
+						Level:     WarningLevel,
+						Message:   fmt.Sprintf("代理组 \"%s\" 引用了不存在的节点: \"%s\"，已自动移除", name, correctedName),
+						Location:  fmt.Sprintf("proxy-groups[%d]", i),
+						Field:     "proxies",
+						AutoFixed: true,
 					})
 					continue
 				}
@@ -341,6 +347,16 @@ func validateProxyGroups(groups []interface{}, proxies []interface{}) *GroupVali
 				})
 			}
 
+			if len(validProxies) == 0 && !hasValidUse && !hasValidFilter && !hasValidIncludeAll {
+				validProxies = append(validProxies, "DIRECT")
+				result.Issues = append(result.Issues, ValidationIssue{
+					Level:     WarningLevel,
+					Message:   fmt.Sprintf("代理组 \"%s\" 清理失效引用后为空，已自动添加 DIRECT", name),
+					Location:  fmt.Sprintf("proxy-groups[%d]", i),
+					Field:     "proxies",
+					AutoFixed: true,
+				})
+			}
 			groupMap["proxies"] = validProxies
 		}
 
@@ -352,8 +368,8 @@ func validateProxyGroups(groups []interface{}, proxies []interface{}) *GroupVali
 	return result
 }
 
-// 检测循环引用
-func detectCircularReferences(groups []interface{}) []ValidationIssue {
+// repairCircularReferences 删除形成环的代理组引用。按配置顺序遍历，结果稳定且不改变其余引用顺序。
+func repairCircularReferences(groups []interface{}) []ValidationIssue {
 	issues := []ValidationIssue{}
 
 	// 构建引用图
@@ -384,50 +400,67 @@ func detectCircularReferences(groups []interface{}) []ValidationIssue {
 		}
 	}
 
-	// DFS检测循环
-	visited := make(map[string]bool)
-	recStack := make(map[string]bool)
-
-	var dfs func(node string, path []string) bool
-	dfs = func(node string, path []string) bool {
-		visited[node] = true
-		recStack[node] = true
-		path = append(path, node)
-
+	state := make(map[string]uint8) // 0=未访问, 1=当前路径, 2=完成
+	var visit func(string)
+	visit = func(node string) {
+		state[node] = 1
+		kept := graph[node][:0]
 		for _, neighbor := range graph[node] {
-			if !visited[neighbor] {
-				if dfs(neighbor, path) {
-					return true
-				}
-			} else if recStack[neighbor] {
-				// 找到循环
-				cycleStart := -1
-				for i, p := range path {
-					if p == neighbor {
-						cycleStart = i
-						break
-					}
-				}
-				if cycleStart >= 0 {
-					cycle := append(path[cycleStart:], neighbor)
-					issues = append(issues, ValidationIssue{
-						Level:    ErrorLevel,
-						Message:  fmt.Sprintf("检测到代理组循环引用: %s", strings.Join(cycle, " → ")),
-						Location: fmt.Sprintf("proxy-groups[%s]", node),
-					})
-				}
-				return true
+			if state[neighbor] == 1 {
+				issues = append(issues, ValidationIssue{
+					Level:     WarningLevel,
+					Message:   fmt.Sprintf("代理组 \"%s\" 到 \"%s\" 的循环引用已自动移除", node, neighbor),
+					Location:  fmt.Sprintf("proxy-groups[%s]", node),
+					Field:     "proxies",
+					AutoFixed: true,
+				})
+				continue
+			}
+			if state[neighbor] == 0 {
+				visit(neighbor)
+			}
+			kept = append(kept, neighbor)
+		}
+		graph[node] = kept
+		state[node] = 2
+	}
+	for _, group := range groups {
+		if groupMap, ok := group.(map[string]interface{}); ok {
+			if name, ok := groupMap["name"].(string); ok && state[name] == 0 {
+				visit(name)
 			}
 		}
-
-		recStack[node] = false
-		return false
 	}
 
-	for node := range graph {
-		if !visited[node] {
-			dfs(node, []string{})
+	// 将修复后的组引用写回，同时保留普通节点及特殊节点。
+	for _, group := range groups {
+		groupMap, ok := group.(map[string]interface{})
+		if !ok {
+			continue
 		}
+		name, _ := groupMap["name"].(string)
+		allowed := make(map[string]bool, len(graph[name]))
+		for _, ref := range graph[name] {
+			allowed[ref] = true
+		}
+		refs, ok := groupMap["proxies"].([]interface{})
+		if !ok {
+			continue
+		}
+		filtered := refs[:0]
+		for _, ref := range refs {
+			refName, isString := ref.(string)
+			if isString {
+				if _, isGroup := graph[refName]; isGroup && !allowed[refName] {
+					continue
+				}
+			}
+			filtered = append(filtered, ref)
+		}
+		if len(filtered) == 0 {
+			filtered = append(filtered, "DIRECT")
+		}
+		groupMap["proxies"] = filtered
 	}
 
 	return issues
