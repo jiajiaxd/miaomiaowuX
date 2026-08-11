@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ var embeddedFiles embed.FS
 // themePlaceholder 是 index.html 内联脚本里的默认主题占位符,serveIndex 时替换成管理员设置的值。
 // 无 cookie 的用户首屏据此决定初始主题(flat / pixel / anime / premium),避免主题加载闪烁。
 const themePlaceholder = "__MMW_DEFAULT_THEME__"
+const premiumThemeAllowedPlaceholder = "__MMW_PREMIUM_THEME_ALLOWED__"
 
 var (
 	initOnce    sync.Once
@@ -31,10 +33,21 @@ var (
 	indexBytes  []byte
 	indexMod    time.Time
 
-	themeMu      sync.RWMutex
-	servedIndex  []byte // indexBytes 替换占位符后的实际下发内容
-	currentTheme = "pixel"
+	themeMu             sync.RWMutex
+	servedIndex         []byte // indexBytes 替换占位符后的实际下发内容
+	currentTheme        = "pixel"
+	premiumThemeAllowed bool
 )
+
+func rebuildServedIndexLocked() {
+	servedIndex = bytes.ReplaceAll(indexBytes, []byte(themePlaceholder), []byte(currentTheme))
+	servedIndex = bytes.ReplaceAll(
+		servedIndex,
+		[]byte(premiumThemeAllowedPlaceholder),
+		[]byte(strconv.FormatBool(premiumThemeAllowed)),
+	)
+	indexMod = time.Now()
+}
 
 // SetDefaultTheme 更新首屏注入的默认主题,供无 mmw-theme-style cookie 的用户决定初始主题。
 // 由 main.go 启动时按 DB 设置调用一次,并在管理员改主题时同步调用。
@@ -46,8 +59,16 @@ func SetDefaultTheme(theme string) {
 	themeMu.Lock()
 	defer themeMu.Unlock()
 	currentTheme = theme
-	servedIndex = bytes.ReplaceAll(indexBytes, []byte(themePlaceholder), []byte(theme))
-	indexMod = time.Now() // 内容变了 → 刷新 modtime,避免 If-Modified-Since 命中旧 index
+	rebuildServedIndexLocked()
+}
+
+// SetPremiumThemeAllowed 控制首页内联脚本是否接受客户端自行写入的 premium cookie。
+func SetPremiumThemeAllowed(allowed bool) {
+	initOnce.Do(initialize)
+	themeMu.Lock()
+	defer themeMu.Unlock()
+	premiumThemeAllowed = allowed
+	rebuildServedIndexLocked()
 }
 
 func initialize() {
@@ -64,7 +85,7 @@ func initialize() {
 		panic(err)
 	}
 	// 默认先按 pixel 替换占位符;main.go 启动后会用 DB 里的值再 SetDefaultTheme 一次。
-	servedIndex = bytes.ReplaceAll(indexBytes, []byte(themePlaceholder), []byte(currentTheme))
+	rebuildServedIndexLocked()
 
 	if info, err := fs.Stat(sub, "index.html"); err == nil {
 		indexMod = info.ModTime()

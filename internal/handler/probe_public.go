@@ -163,6 +163,9 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	if !validProbeThemeName(theme) || theme == "follow" {
 		theme = "pixel"
 	}
+	if theme == "premium" && (h.licenseManager == nil || !h.licenseManager.CanUsePremiumTheme()) {
+		theme = "pixel"
+	}
 	// 未登录访客要据此决定 /login 是否放行,所以必须走公开端点
 	blockLogin, _ := h.repo.GetSystemSetting(ctx, probeDisguiseBlockLoginKey)
 	showName := func() bool { v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowNameKey); return v == "1" }()

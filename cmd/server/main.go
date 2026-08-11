@@ -212,7 +212,19 @@ func main() {
 	licenseManager := license.NewManager(repo, license.GetMachineID())
 	// 注入 usage 来源,让心跳把"本机当前 used_servers/nodes/users" 上报给 license 服务器。
 	licenseManager.SetUsageReporter(repo)
+	reconcilePremiumThemes := func() {
+		allowed := licenseManager.CanUsePremiumTheme()
+		theme, reconcileErr := handler.ReconcilePremiumThemeSettings(context.Background(), repo, allowed)
+		if reconcileErr != nil {
+			logger.Error("Premium 主题许可证状态同步失败", "error", reconcileErr)
+			return
+		}
+		web.SetPremiumThemeAllowed(allowed)
+		web.SetDefaultTheme(theme)
+	}
+	licenseManager.SetOnStatusChecked(reconcilePremiumThemes)
 	licenseManager.Start(context.Background())
+	reconcilePremiumThemes()
 	defer licenseManager.Stop()
 
 	authManager, err := auth.NewManager(repo)
@@ -921,15 +933,13 @@ func main() {
 	mux.Handle("/api/admin/database/migrate", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(databaseSettingsHandler.Migrate)))
 	systemSettingsHandler.SetCollector(trafficCollector)
 	systemSettingsHandler.SetWSHandler(remoteWSHandler)
+	systemSettingsHandler.SetLicenseManager(licenseManager)
 	systemSettingsHandler.SetOnMasterURLChanged(remoteManageHandler.BroadcastMasterURLUpdate)
 	// 启动时加载加密设置
 	if encVal, _ := repo.GetSystemSetting(context.Background(), "require_encryption"); encVal == "true" {
 		cryptoConfig.SetRequireEncryption(true)
 	}
-	// 启动时把 DB 里的默认主题注入到下发的 index.html(无 cookie 的用户首屏据此套主题,无闪烁)
-	if theme, _ := repo.GetSystemSetting(context.Background(), handler.DefaultThemeKey); theme != "" {
-		web.SetDefaultTheme(theme)
-	}
+	// 默认主题已在许可证初始化后由 reconcilePremiumThemes 注入；Premium 无授权时会先回退。
 	// 更新走 CDN 加速开关:默认开启(域名写死在代码);DB 里显式存 "0"/"false" 才关闭 → 回退直连 GitHub
 	if v, _ := repo.GetSystemSetting(context.Background(), handler.UpdateCDNEnabledKey); v == "0" || v == "false" {
 		handler.SetUpdateCDNEnabled(false)

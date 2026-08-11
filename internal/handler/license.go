@@ -62,8 +62,9 @@ func (h *LicenseHandler) UpdateSettings(w http.ResponseWriter, r *http.Request) 
 func (h *LicenseHandler) UserGetStatus(w http.ResponseWriter, r *http.Request) {
 	status := h.manager.GetStatus()
 	resp := map[string]any{
-		"success": true,
-		"valid":   status.Valid,
+		"success":       true,
+		"valid":         status.Valid,
+		"premium_theme": h.manager.CanUsePremiumTheme(),
 	}
 	if status.Plan != nil {
 		resp["plan"] = map[string]any{

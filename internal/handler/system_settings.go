@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"miaomiaowux/internal/agentlog"
+	"miaomiaowux/internal/license"
 	"miaomiaowux/internal/storage"
 	"miaomiaowux/internal/traffic"
 )
@@ -26,6 +27,7 @@ type SystemSettingsHandler struct {
 	collector          *traffic.Collector // 可选,SetIntervals 时调 hot-reload ticker;nil 时仅落库
 	wsHandler          *RemoteWSHandler   // 可选,SetDashboardRefresh 后广播 config_update 给所有 WS-mode agent
 	onMasterURLChanged func(ctx context.Context, newURL string)
+	licenseManager     *license.Manager
 }
 
 func NewSystemSettingsHandler(repo *storage.TrafficRepository, crypto *CryptoConfig) *SystemSettingsHandler {
@@ -38,6 +40,11 @@ func (h *SystemSettingsHandler) SetCollector(c *traffic.Collector) { h.collector
 
 // SetWSHandler 注入 WS handler 让 SetDashboardRefresh 后向所有 agent 广播 config_update。
 func (h *SystemSettingsHandler) SetWSHandler(ws *RemoteWSHandler) { h.wsHandler = ws }
+
+// SetLicenseManager 注入许可证管理器，用于 Premium 主题的服务端门控。
+func (h *SystemSettingsHandler) SetLicenseManager(manager *license.Manager) {
+	h.licenseManager = manager
+}
 
 // SetOnMasterURLChanged 注入主控地址变更后的 Agent 同步器。
 func (h *SystemSettingsHandler) SetOnMasterURLChanged(fn func(ctx context.Context, newURL string)) {
@@ -407,6 +414,9 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	if !validProbeThemeName(theme) {
 		theme = "follow"
 	}
+	if theme == "premium" && !h.premiumThemeAllowed() {
+		theme = "follow"
+	}
 	logo, _ := h.repo.GetSystemSetting(ctx, probeDisguiseLogoKey)
 	blockLogin, _ := h.repo.GetSystemSetting(ctx, probeDisguiseBlockLoginKey)
 	showName, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowNameKey)
@@ -539,6 +549,10 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "请求格式错误"})
+		return
+	}
+	if req.Theme != nil && strings.EqualFold(strings.TrimSpace(*req.Theme), "premium") && !h.premiumThemeAllowed() {
+		writeJSONError(w, http.StatusForbidden, "Premium 主题仅限付费许可证使用")
 		return
 	}
 
@@ -1224,8 +1238,38 @@ func (h *SystemSettingsHandler) SetSubscriptionOutputFormat(w http.ResponseWrite
 // 无 mmw-theme-style cookie 的用户首屏用它决定初始主题(由 web.SetDefaultTheme 注入 index.html)。
 const DefaultThemeKey = "default_theme"
 
+// ReconcilePremiumThemeSettings 把无付费许可证时被直接写进数据库的 Premium 主题恢复为安全值。
+// 返回最终应注入首页的默认主题，供许可证心跳回调同步 web 层缓存。
+func ReconcilePremiumThemeSettings(ctx context.Context, repo *storage.TrafficRepository, allowed bool) (string, error) {
+	defaultTheme, _ := repo.GetSystemSetting(ctx, DefaultThemeKey)
+	if !allowed && defaultTheme == "premium" {
+		defaultTheme = "pixel"
+		if err := repo.SetSystemSetting(ctx, DefaultThemeKey, defaultTheme); err != nil {
+			return "", err
+		}
+	}
+	if defaultTheme != "flat" && defaultTheme != "pixel" && defaultTheme != "anime" && defaultTheme != "premium" {
+		defaultTheme = "pixel"
+	}
+
+	probeTheme, _ := repo.GetSystemSetting(ctx, probeDisguiseThemeKey)
+	if !allowed && probeTheme == "premium" {
+		if err := repo.SetSystemSetting(ctx, probeDisguiseThemeKey, "follow"); err != nil {
+			return "", err
+		}
+	}
+	return defaultTheme, nil
+}
+
+func (h *SystemSettingsHandler) premiumThemeAllowed() bool {
+	return h.licenseManager != nil && h.licenseManager.CanUsePremiumTheme()
+}
+
 func (h *SystemSettingsHandler) GetDefaultTheme(w http.ResponseWriter, r *http.Request) {
 	value, _ := h.repo.GetSystemSetting(r.Context(), DefaultThemeKey)
+	if value == "premium" && !h.premiumThemeAllowed() {
+		value = "pixel"
+	}
 	if value != "flat" && value != "pixel" && value != "anime" && value != "premium" {
 		value = "pixel"
 	}
@@ -1247,6 +1291,10 @@ func (h *SystemSettingsHandler) SetDefaultTheme(w http.ResponseWriter, r *http.R
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]any{"success": false, "message": "主题必须为 flat / pixel / anime / premium"})
+		return
+	}
+	if req.DefaultTheme == "premium" && !h.premiumThemeAllowed() {
+		writeJSONError(w, http.StatusForbidden, "Premium 主题仅限付费许可证使用")
 		return
 	}
 	if err := h.repo.SetSystemSetting(r.Context(), DefaultThemeKey, req.DefaultTheme); err != nil {

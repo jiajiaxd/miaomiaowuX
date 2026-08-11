@@ -102,6 +102,9 @@ type Manager struct {
 	// 没有「有效→失效时撤销」。而 agent 侧的限速是纯内存态,主控不推新配置 ≠ 限速消失 ——
 	// 降级后 agent 上那份 PRO 时期的限速配置会一直生效到进程重启。
 	onFeatureLost func(feature string)
+	// onStatusChecked 在许可证服务器返回并通过协议校验后触发。它与状态是否发生变化无关，
+	// 用于周期性纠正直接修改数据库绕过许可证门控的本地配置。
+	onStatusChecked func()
 }
 
 // watchedFeatures 是需要在丢失时通知 handler 主动撤销已下发配置的特性。
@@ -128,6 +131,13 @@ func (m *Manager) SetOnQuotaChange(cb func()) {
 func (m *Manager) SetOnFeatureLost(cb func(feature string)) {
 	m.mu.Lock()
 	m.onFeatureLost = cb
+	m.mu.Unlock()
+}
+
+// SetOnStatusChecked 注册每次有效许可证响应处理完成后的回调。
+func (m *Manager) SetOnStatusChecked(cb func()) {
+	m.mu.Lock()
+	m.onStatusChecked = cb
 	m.mu.Unlock()
 }
 
@@ -189,6 +199,15 @@ func (m *Manager) IsValid() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.isValidLocked()
+}
+
+// FeaturePremiumTheme 只由许可证服务为真实付费许可证签发。
+const FeaturePremiumTheme = "premium_theme"
+
+// CanUsePremiumTheme 使用 per-feature Ed25519 token 判断 Premium 主题资格。
+// 不能退化成套餐名判断：免费许可证同样可能拥有非 TRIAL 套餐。
+func (m *Manager) CanUsePremiumTheme() bool {
+	return m.HasFeature(FeaturePremiumTheme)
 }
 
 // isValidLocked 是 IsValid 的无锁版,调用方须持有 m.mu(R 或 W)。
@@ -482,6 +501,7 @@ func (m *Manager) parseResponse(ctx context.Context, resp *http.Response, nonce 
 	cb := m.onRecover
 	quotaCb := m.onQuotaChange
 	lostCb := m.onFeatureLost
+	checkedCb := m.onStatusChecked
 	m.mu.Unlock()
 
 	m.persistStatus(ctx)
@@ -506,6 +526,9 @@ func (m *Manager) parseResponse(ctx context.Context, resp *http.Response, nonce 
 				go lostCb(f)
 			}
 		}
+	}
+	if checkedCb != nil {
+		go checkedCb()
 	}
 	return needReactivate
 }
