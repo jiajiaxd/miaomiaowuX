@@ -350,6 +350,8 @@ const (
 	probeDisguiseShowExpiryKey          = "probe_disguise_show_expiry"
 	probeDisguiseShowPriceKey           = "probe_disguise_show_price"
 	probeDisguiseShowGlobeKey           = "probe_disguise_show_globe"
+	probeDisguiseShowDailyTrendKey      = "probe_disguise_show_daily_trend"
+	probeDisguiseShowTrafficHotspotsKey = "probe_disguise_show_traffic_hotspots"
 	probeDisguiseShowTraffic7DKey       = "probe_disguise_show_traffic_7d"
 	probeDisguiseShowResourceHeatmapKey = "probe_disguise_show_resource_heatmap"
 	probeDisguiseShowTrafficQuotaKey    = "probe_disguise_show_traffic_quota"
@@ -427,6 +429,8 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 	showExpiry, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowExpiryKey)
 	showPrice, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowPriceKey)
 	showGlobe, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowGlobeKey)
+	showDailyTrend, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowDailyTrendKey)
+	showTrafficHotspots, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowTrafficHotspotsKey)
 	showTraffic7D, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowTraffic7DKey)
 	showResourceHeatmap, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowResourceHeatmapKey)
 	showTrafficQuota, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowTrafficQuotaKey)
@@ -474,6 +478,8 @@ func (h *SystemSettingsHandler) GetProbeDisguise(w http.ResponseWriter, r *http.
 		"show_expiry":               showExpiry == "1",
 		"show_price":                showPrice == "1",
 		"show_globe":                showGlobe == "1",
+		"show_daily_trend":          showDailyTrend != "0",
+		"show_traffic_hotspots":     showTrafficHotspots != "0",
 		"show_traffic_7d":           showTraffic7D != "0",
 		"show_resource_heatmap":     showResourceHeatmap != "0",
 		"show_traffic_quota":        showTrafficQuota != "0",
@@ -513,6 +519,8 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 		ShowExpiry          *bool              `json:"show_expiry"`
 		ShowPrice           *bool              `json:"show_price"`
 		ShowGlobe           *bool              `json:"show_globe"`
+		ShowDailyTrend      *bool              `json:"show_daily_trend"`
+		ShowTrafficHotspots *bool              `json:"show_traffic_hotspots"`
 		ShowTraffic7D       *bool              `json:"show_traffic_7d"`
 		ShowResourceHeatmap *bool              `json:"show_resource_heatmap"`
 		ShowTrafficQuota    *bool              `json:"show_traffic_quota"`
@@ -700,6 +708,8 @@ func (h *SystemSettingsHandler) SetProbeDisguise(w http.ResponseWriter, r *http.
 	}
 	if !setDisplayPtr(probeDisguiseMetricTrafficKey, req.MetricTraffic) ||
 		!setDisplayPtr(probeDisguiseMetricSpeedKey, req.MetricSpeed) ||
+		!setDisplayPtr(probeDisguiseShowDailyTrendKey, req.ShowDailyTrend) ||
+		!setDisplayPtr(probeDisguiseShowTrafficHotspotsKey, req.ShowTrafficHotspots) ||
 		!setDisplayPtr(probeDisguiseShowTraffic7DKey, req.ShowTraffic7D) ||
 		!setDisplayPtr(probeDisguiseShowResourceHeatmapKey, req.ShowResourceHeatmap) ||
 		!setDisplayPtr(probeDisguiseShowTrafficQuotaKey, req.ShowTrafficQuota) ||

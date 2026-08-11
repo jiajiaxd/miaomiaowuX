@@ -180,6 +180,11 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 	showExpiry := h.setting(ctx, probeDisguiseShowExpiryKey)
 	showPrice := h.setting(ctx, probeDisguiseShowPriceKey)
 	showGlobe := h.setting(ctx, probeDisguiseShowGlobeKey)
+	showDailyTrend := func() bool { v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowDailyTrendKey); return v != "0" }()
+	showTrafficHotspots := func() bool {
+		v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowTrafficHotspotsKey)
+		return v != "0"
+	}()
 	showTraffic7D := func() bool { v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowTraffic7DKey); return v != "0" }()
 	showResourceHeatmap := func() bool {
 		v, _ := h.repo.GetSystemSetting(ctx, probeDisguiseShowResourceHeatmapKey)
@@ -328,6 +333,8 @@ func (h *ProbePublicHandler) buildPayload(ctx context.Context) (map[string]any, 
 		"block_login":           blockLogin == "1",
 		"show_name":             showName,
 		"show_globe":            showGlobe,
+		"show_daily_trend":      showDailyTrend,
+		"show_traffic_hotspots": showTrafficHotspots,
 		"show_traffic_7d":       showTraffic7D,
 		"show_resource_heatmap": showResourceHeatmap,
 		"show_traffic_quota":    showTrafficQuota,
