@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -269,6 +270,20 @@ func TestSQLiteToPostgresMigrationIntegration(t *testing.T) {
 	}
 	defer source.Close()
 	ctx := context.Background()
+	systemConfig, err := source.GetSystemConfig(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	systemConfig.NotifyEnabled = true
+	systemConfig.TelegramBotToken = "migration-bot-token"
+	systemConfig.TelegramChatID = "migration-chat-id"
+	systemConfig.NotifyServerOffline = true
+	if err := source.UpdateSystemConfig(ctx, systemConfig); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.SetSystemSetting(ctx, "migration-config-key", "source-value"); err != nil {
+		t.Fatal(err)
+	}
 	if err := source.CreateUser(ctx, "migrated", "migrated@example.test", "Migrated", "hash", RoleUser, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -322,6 +337,17 @@ func TestSQLiteToPostgresMigrationIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer postgres.Close()
+	migratedConfig, err := postgres.GetSystemConfig(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migratedConfig.NotifyEnabled || migratedConfig.TelegramBotToken != "migration-bot-token" || migratedConfig.TelegramChatID != "migration-chat-id" || !migratedConfig.NotifyServerOffline {
+		t.Fatalf("system config was replaced by PostgreSQL defaults: %+v", migratedConfig)
+	}
+	migratedSetting, err := postgres.GetSystemSetting(ctx, "migration-config-key")
+	if err != nil || migratedSetting != "source-value" {
+		t.Fatalf("system setting=%q err=%v", migratedSetting, err)
+	}
 	if _, err := postgres.GetUser(ctx, "migrated"); err != nil {
 		t.Fatal(err)
 	}
@@ -388,6 +414,27 @@ func TestTopologicalTableOrder(t *testing.T) {
 	}
 	if positions["subscribe_files"] > positions["custom_rule_applications"] || positions["custom_rules"] > positions["custom_rule_applications"] {
 		t.Fatalf("invalid order: %v", ordered)
+	}
+}
+
+func TestMigrationInsertStatementUpsertsConfigurationTables(t *testing.T) {
+	quoted := []string{`"id"`, `"telegram_bot_token"`}
+	placeholders := []string{"?", "?"}
+	got := migrationInsertStatement("system_config", quoted, placeholders)
+	want := `INSERT INTO "system_config" ("id","telegram_bot_token") VALUES (?,?) ON CONFLICT ("id") DO UPDATE SET "telegram_bot_token" = excluded."telegram_bot_token"`
+	if got != want {
+		t.Fatalf("system_config statement:\n got: %s\nwant: %s", got, want)
+	}
+
+	got = migrationInsertStatement("system_settings", []string{`"key"`, `"value"`}, placeholders)
+	want = `INSERT INTO "system_settings" ("key","value") VALUES (?,?) ON CONFLICT ("key") DO UPDATE SET "value" = excluded."value"`
+	if got != want {
+		t.Fatalf("system_settings statement:\n got: %s\nwant: %s", got, want)
+	}
+
+	got = migrationInsertStatement("users", []string{`"id"`, `"username"`}, placeholders)
+	if !strings.HasSuffix(got, "ON CONFLICT DO NOTHING") {
+		t.Fatalf("ordinary table must keep skip semantics: %s", got)
 	}
 }
 

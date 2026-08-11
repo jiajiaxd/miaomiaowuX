@@ -632,7 +632,7 @@ func copyTable(ctx context.Context, source *sql.Tx, target *dialectTx, table str
 		return 0, 0, err
 	}
 	defer rows.Close()
-	stmt := `INSERT INTO ` + quoteIdentifier(table) + ` (` + strings.Join(quoted, ",") + `) VALUES (` + strings.Join(placeholders, ",") + `) ON CONFLICT DO NOTHING`
+	stmt := migrationInsertStatement(table, quoted, placeholders)
 	var count, eligible int64
 	for rows.Next() {
 		eligible++
@@ -670,6 +670,34 @@ func copyTable(ctx context.Context, source *sql.Tx, target *dialectTx, table str
 		return count, 0, err
 	}
 	return count, total - eligible, nil
+}
+
+// migrationInsertStatement keeps source configuration authoritative when the
+// freshly initialized PostgreSQL schema already contains default rows. Both
+// system_config(id=1) and system_settings keys are created during repository
+// initialization, so ON CONFLICT DO NOTHING would silently retain defaults and
+// discard the SQLite notification token, API token, theme, and other settings.
+func migrationInsertStatement(table string, quoted, placeholders []string) string {
+	stmt := `INSERT INTO ` + quoteIdentifier(table) + ` (` + strings.Join(quoted, ",") + `) VALUES (` + strings.Join(placeholders, ",") + `)`
+	conflictColumn := ""
+	switch table {
+	case "system_config":
+		conflictColumn = "id"
+	case "system_settings":
+		conflictColumn = "key"
+	}
+	if conflictColumn == "" {
+		return stmt + ` ON CONFLICT DO NOTHING`
+	}
+
+	updates := make([]string, 0, len(quoted)-1)
+	for _, column := range quoted {
+		if column == quoteIdentifier(conflictColumn) {
+			continue
+		}
+		updates = append(updates, column+` = excluded.`+column)
+	}
+	return stmt + ` ON CONFLICT (` + quoteIdentifier(conflictColumn) + `) DO UPDATE SET ` + strings.Join(updates, ",")
 }
 
 func normalizePostgresValue(value any, targetType string) (any, error) {
