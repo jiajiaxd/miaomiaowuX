@@ -210,21 +210,24 @@ func main() {
 	cryptoConfig := handler.NewCryptoConfig(masterIdentity, securechan.NewSessionCache(1*time.Hour))
 
 	licenseManager := license.NewManager(repo, license.GetMachineID())
+	brandingHandler := handler.NewBrandingHandler(repo, licenseManager)
+	brandingHandler.SetOnSiteTitleChanged(web.SetSiteTitle)
 	// 注入 usage 来源,让心跳把"本机当前 used_servers/nodes/users" 上报给 license 服务器。
 	licenseManager.SetUsageReporter(repo)
-	reconcilePremiumThemes := func() {
+	reconcileLicensedAppearance := func() {
 		allowed := licenseManager.CanUsePremiumTheme()
 		theme, reconcileErr := handler.ReconcilePremiumThemeSettings(context.Background(), repo, allowed)
 		if reconcileErr != nil {
 			logger.Error("Premium 主题许可证状态同步失败", "error", reconcileErr)
-			return
+		} else {
+			web.SetPremiumThemeAllowed(allowed)
+			web.SetDefaultTheme(theme)
 		}
-		web.SetPremiumThemeAllowed(allowed)
-		web.SetDefaultTheme(theme)
+		web.SetSiteTitle(brandingHandler.EffectiveSiteTitle(context.Background()))
 	}
-	licenseManager.SetOnStatusChecked(reconcilePremiumThemes)
+	licenseManager.SetOnStatusChecked(reconcileLicensedAppearance)
 	licenseManager.Start(context.Background())
-	reconcilePremiumThemes()
+	reconcileLicensedAppearance()
 	defer licenseManager.Stop()
 
 	authManager, err := auth.NewManager(repo)
@@ -665,7 +668,6 @@ func main() {
 	// 服务器分享(PRO):拥有方生成/管理分享令牌
 	mux.Handle("/api/admin/server-share/", auth.RequireAdmin(tokenStore, userRepo, handler.NewServerShareHandler(repo, licenseManager, remoteManageHandler)))
 	// 自定义品牌(PRO):管理员设置站点标题/左上角标题/logo;是否生效由 license.FeatureCustomBranding 门控。
-	brandingHandler := handler.NewBrandingHandler(repo, licenseManager)
 	mux.Handle("/api/admin/system-settings/branding", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(brandingHandler.Admin)))
 	mux.Handle("/api/admin/system-settings/branding/logo", auth.RequireAdmin(tokenStore, userRepo, http.HandlerFunc(brandingHandler.UploadLogo)))
 	// 公开读取(无鉴权:登录页也要能拿品牌);门控在 handler 内 —— 无 PRO 一律返回空/404。

@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"embed"
+	"html"
 	"io/fs"
 	"net/http"
 	"path"
@@ -25,6 +26,8 @@ var embeddedFiles embed.FS
 // 无 cookie 的用户首屏据此决定初始主题(flat / pixel / anime / premium),避免主题加载闪烁。
 const themePlaceholder = "__MMW_DEFAULT_THEME__"
 const premiumThemeAllowedPlaceholder = "__MMW_PREMIUM_THEME_ALLOWED__"
+const siteTitlePlaceholder = "__MMW_SITE_TITLE__"
+const defaultSiteTitle = "妙妙屋X"
 
 var (
 	initOnce    sync.Once
@@ -37,6 +40,7 @@ var (
 	servedIndex         []byte // indexBytes 替换占位符后的实际下发内容
 	currentTheme        = "pixel"
 	premiumThemeAllowed bool
+	currentSiteTitle    = defaultSiteTitle
 )
 
 func rebuildServedIndexLocked() {
@@ -46,7 +50,26 @@ func rebuildServedIndexLocked() {
 		[]byte(premiumThemeAllowedPlaceholder),
 		[]byte(strconv.FormatBool(premiumThemeAllowed)),
 	)
+	servedIndex = bytes.ReplaceAll(
+		servedIndex,
+		[]byte(siteTitlePlaceholder),
+		[]byte(html.EscapeString(currentSiteTitle)),
+	)
 	indexMod = time.Now()
+}
+
+// SetSiteTitle 更新 HTML 首屏的 <title>。React 启动后仍会通过 /api/branding 热更新，
+// 但首次解析 HTML 时浏览器已经拿到正确标题，不再先显示内置名称再跳变。
+func SetSiteTitle(title string) {
+	initOnce.Do(initialize)
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = defaultSiteTitle
+	}
+	themeMu.Lock()
+	defer themeMu.Unlock()
+	currentSiteTitle = title
+	rebuildServedIndexLocked()
 }
 
 // SetDefaultTheme 更新首屏注入的默认主题,供无 mmw-theme-style cookie 的用户决定初始主题。

@@ -46,12 +46,18 @@ var brandingLogoTypes = map[string]string{
 
 // BrandingHandler 提供自定义品牌的读写与 logo 上传/服务。
 type BrandingHandler struct {
-	repo    *storage.TrafficRepository
-	license *license.Manager
+	repo               *storage.TrafficRepository
+	license            *license.Manager
+	onSiteTitleChanged func(string)
 }
 
 func NewBrandingHandler(repo *storage.TrafficRepository, lic *license.Manager) *BrandingHandler {
 	return &BrandingHandler{repo: repo, license: lic}
+}
+
+// SetOnSiteTitleChanged 注册运行时标题同步回调。用于让静态 HTML 首屏和公开品牌接口保持一致。
+func (h *BrandingHandler) SetOnSiteTitleChanged(fn func(string)) {
+	h.onSiteTitleChanged = fn
 }
 
 func (h *BrandingHandler) featureOn() bool {
@@ -71,6 +77,14 @@ func (h *BrandingHandler) load(ctx context.Context) brandingConfig {
 		BrandTitle: get(brandingBrandTitleKey),
 		LogoURL:    get(brandingLogoURLKey),
 	}
+}
+
+// EffectiveSiteTitle 返回经过许可证门控后的标题。空字符串表示使用内置标题。
+func (h *BrandingHandler) EffectiveSiteTitle(ctx context.Context) string {
+	if !h.featureOn() {
+		return ""
+	}
+	return h.load(ctx).SiteTitle
 }
 
 // Admin 按方法分发 /api/admin/system-settings/branding:GET 读、POST 写。
@@ -113,6 +127,9 @@ func (h *BrandingHandler) AdminSet(w http.ResponseWriter, r *http.Request) {
 	_ = h.repo.SetSystemSetting(ctx, brandingBrandTitleKey, strings.TrimSpace(req.BrandTitle))
 	// LogoURL:允许清空或填外部 URL(上传走单独接口,会覆盖成内部路径;此处原样保留前端传的值)。
 	_ = h.repo.SetSystemSetting(ctx, brandingLogoURLKey, strings.TrimSpace(req.LogoURL))
+	if h.onSiteTitleChanged != nil {
+		h.onSiteTitleChanged(h.EffectiveSiteTitle(ctx))
+	}
 	respondJSON(w, http.StatusOK, map[string]any{"success": true, "feature_enabled": h.featureOn()})
 }
 
