@@ -14270,6 +14270,7 @@ func (r *TrafficRepository) ListExpiringCertificates(ctx context.Context, days i
 	if days <= 0 {
 		days = 30
 	}
+	cutoff := time.Now().UTC().AddDate(0, 0, days)
 
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, domain, email, provider, cert_path, key_path, cert_pem, key_pem,
@@ -14280,9 +14281,9 @@ func (r *TrafficRepository) ListExpiringCertificates(ctx context.Context, days i
 		WHERE auto_renew = 1
 		  AND status = 'valid'
 		  AND expiry_date IS NOT NULL
-		  AND expiry_date <= datetime('now', '+' || ? || ' days')
+		  AND expiry_date <= ?
 		ORDER BY expiry_date ASC
-	`, days)
+	`, cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("list expiring certificates: %w", err)
 	}

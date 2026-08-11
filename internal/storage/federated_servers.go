@@ -29,13 +29,11 @@ func (r *TrafficRepository) ensureFederatedServersTable(ctx context.Context) err
 	)`); err != nil {
 		return err
 	}
-	// 旧表补列(忽略已存在错误)
-	var cnt int
-	_ = r.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM pragma_table_info('federated_servers') WHERE name = 'prefix'`).Scan(&cnt)
-	if cnt == 0 {
-		_, _ = r.db.ExecContext(ctx, `ALTER TABLE federated_servers ADD COLUMN prefix TEXT NOT NULL DEFAULT ''`)
-	}
-	return nil
+	// 旧表补列。ensureTableColumn 使用标准 PRAGMA table_info 形式，
+	// PostgreSQL 会由 dialectDB 改写为 information_schema.columns 查询。
+	// 不要使用 SQLite 特有的 pragma_table_info(...) 表值函数：它不会
+	// 被方言适配器识别，且忽略错误后会在每次查询时重复执行 ADD COLUMN。
+	return r.ensureTableColumn("federated_servers", "prefix", "TEXT NOT NULL DEFAULT ''")
 }
 
 func (r *TrafficRepository) SetFederatedServer(ctx context.Context, serverID int64, ownerURL, shareToken, prefix string) error {

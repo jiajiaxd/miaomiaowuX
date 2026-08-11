@@ -1,8 +1,14 @@
 package handler
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"miaomiaowux/internal/storage"
 )
@@ -113,6 +119,68 @@ func TestPackageNodeDiff(t *testing.T) {
 	added, removed := packageNodeDiff([]int64{1, 2, 4}, []int64{2, 3, 4})
 	if len(added) != 1 || added[0] != 3 || len(removed) != 1 || removed[0] != 1 {
 		t.Fatalf("added=%v removed=%v", added, removed)
+	}
+}
+
+func TestPackageNodeSkipsInboundSyncForExternalNodes(t *testing.T) {
+	if !packageNodeSkipsInboundSync(storage.Node{NodeType: "physical"}) {
+		t.Fatal("external node without inbound_tag must not trigger managed Xray synchronization")
+	}
+	if !packageNodeSkipsInboundSync(storage.Node{NodeType: "physical", InboundTag: "  "}) {
+		t.Fatal("blank inbound_tag must be treated as absent")
+	}
+	if packageNodeSkipsInboundSync(storage.Node{NodeType: "physical", InboundTag: "vless-443"}) {
+		t.Fatal("managed physical node must be synchronized")
+	}
+	if packageNodeSkipsInboundSync(storage.Node{NodeType: "routed"}) {
+		t.Fatal("routed nodes use their dedicated synchronization path")
+	}
+}
+
+func TestPackageUpdateAllowsExternalNodeWithoutInboundTag(t *testing.T) {
+	repo, err := storage.NewTrafficRepository(filepath.Join(t.TempDir(), "external-package.db"))
+	if err != nil {
+		t.Fatalf("NewTrafficRepository: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	ctx := context.Background()
+
+	if err := repo.CreateUser(ctx, "external-user", "external@example.com", "external-user", "hash", "user", ""); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	pkgID, err := repo.CreatePackage(ctx, storage.Package{
+		Name: "external-package", TrafficLimitGB: 100, TrafficLimitBytes: 100 << 30, CycleDays: 30,
+	})
+	if err != nil {
+		t.Fatalf("CreatePackage: %v", err)
+	}
+	now := time.Now()
+	if err := repo.AssignPackageToUser(ctx, "external-user", pkgID, now, now.AddDate(0, 1, 0), false, 0); err != nil {
+		t.Fatalf("AssignPackageToUser: %v", err)
+	}
+	node, err := repo.CreateNode(ctx, storage.Node{
+		Username: "admin", RawURL: "ss://external", NodeName: "External Node", Protocol: "ss", Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateNode: %v", err)
+	}
+
+	h := NewPackageUpdateHandler(repo, nil, nil)
+	body := `{"id":` + strconv.FormatInt(pkgID, 10) +
+		`,"name":"external-package","traffic_limit_gb":100,"cycle_days":30,"nodes":[` +
+		strconv.FormatInt(node.ID, 10) + `]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/admin/packages/update", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("external node update returned %d: %s", rec.Code, rec.Body.String())
+	}
+	updated, err := repo.GetPackage(ctx, pkgID)
+	if err != nil {
+		t.Fatalf("GetPackage: %v", err)
+	}
+	if len(updated.Nodes) != 1 || updated.Nodes[0] != node.ID {
+		t.Fatalf("external node was not saved: %v", updated.Nodes)
 	}
 }
 

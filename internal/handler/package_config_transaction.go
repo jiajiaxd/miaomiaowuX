@@ -231,6 +231,13 @@ func packageNodeDiff(oldNodes, newNodes []int64) (added, removed []int64) {
 	return
 }
 
+// packageNodeSkipsInboundSync reports whether a package node is subscription-only.
+// External/imported nodes intentionally have no inbound_tag: they belong in the
+// generated subscription, but there is no managed Xray inbound to mutate for them.
+func packageNodeSkipsInboundSync(node storage.Node) bool {
+	return node.NodeType != "routed" && strings.TrimSpace(node.InboundTag) == ""
+}
+
 func (h *PackageUpdateHandler) syncPackageNodesTransactionally(ctx context.Context, packageID int64, oldNodes, newNodes []int64) error {
 	addedNodes, removedNodes := packageNodeDiff(oldNodes, newNodes)
 	if len(addedNodes) == 0 && len(removedNodes) == 0 {
@@ -261,7 +268,7 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 	stillUsed := map[string]bool{}
 	for _, nodeID := range newNodes {
 		node, err := h.repo.GetNodeByID(ctx, nodeID)
-		if err != nil || node.NodeType == "routed" || node.InboundTag == "" {
+		if err != nil || node.NodeType == "routed" || packageNodeSkipsInboundSync(node) {
 			continue
 		}
 		server, _ := resolveNodeServer(ctx, h.repo, h.remoteManage, node)
@@ -311,6 +318,9 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 					rollbackReservations()
 					return fmt.Errorf("添加用户 %s 到路由节点 %s: %w", user.Username, node.NodeName, err)
 				}
+				continue
+			}
+			if packageNodeSkipsInboundSync(node) {
 				continue
 			}
 
@@ -389,6 +399,9 @@ func (h *PackageUpdateHandler) syncPackageUserNodesTransactionally(ctx context.C
 					return fmt.Errorf("从路由节点 %s 移除用户 %s: %w", node.NodeName, user.Username, err)
 				}
 				delta.routedBefore[fmt.Sprintf("%s|%d", user.Username, node.ID)] = routedActiveBefore{id: subaccount.ID, active: true}
+				continue
+			}
+			if packageNodeSkipsInboundSync(node) {
 				continue
 			}
 
