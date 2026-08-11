@@ -58,10 +58,23 @@ func (h *TrafficHandler) handleLedgerPeriod(w http.ResponseWriter, r *http.Reque
 		h.writeJSON(w, http.StatusInternalServerError, map[string]any{"success": false, "error": err.Error()})
 		return
 	}
-	h.writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"success": true, "range": rangeName, "range_start": start, "range_end": end,
 		"timezone": time.Now().Location().String(), "complete": h.repo.DailyTrafficLedgerComplete(r.Context(), start), "items": items,
-	})
+	}
+	if view == "user-nodes" {
+		period := map[string]any{"start": nil, "end": nil}
+		if periodStart, periodEnd, periodErr := h.repo.GetUserPackagePeriod(r.Context(), strings.TrimSpace(r.URL.Query().Get("username"))); periodErr == nil {
+			if periodStart != nil {
+				period["start"] = periodStart.Format("2006-01-02")
+			}
+			if periodEnd != nil {
+				period["end"] = periodEnd.Format("2006-01-02")
+			}
+		}
+		response["package_period"] = period
+	}
+	h.writeJSON(w, http.StatusOK, response)
 }
 
 func (h *TrafficHandler) ledgerUserNodesPeriod(r *http.Request, rangeName string) ([]periodTrafficItem, string, string, error) {
