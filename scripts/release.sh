@@ -109,10 +109,29 @@ if [ -z "$PREV_TAG" ]; then
   exit 1
 fi
 
-# 保留 git log 的提交顺序和每一条提交；不能 sort -u，否则同名提交会丢失且顺序被打乱。
+# 先按完整提交消息去重，但不使用 sort -u：awk 保留 git log 中第一次出现的位置，
+# 因而相同消息只展示最新的一条，同时不打乱其余提交的时间顺序。
 # 只排除脚本自身生成的纯版本号 commit 和 merge commit。
-COMMITS=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" --no-merges \
-  | grep -Ev '^- v?[0-9]+\.[0-9]+\.[0-9]+([.-](beta|rc)\.[0-9]+)?$' || true)
+UNIQUE_COMMITS=$(git log "${PREV_TAG}..HEAD" --pretty=format:"%s" --no-merges \
+  | grep -Ev '^v?[0-9]+\.[0-9]+\.[0-9]+([.-](beta|rc)\.[0-9]+)?$' \
+  | awk 'NF && !seen[$0]++' || true)
+
+# 正式版会汇总上一个稳定版之后的全部 beta/rc 历史。将彩虹提交统一排在顶部，
+# 方便 Release 页面优先展示主要功能；两个分组内部仍保持原始 git log 顺序。
+if [ "$RELEASE_KIND" = "stable" ]; then
+  RAINBOW_COMMITS=$(printf '%s\n' "$UNIQUE_COMMITS" | grep '🌈' || true)
+  OTHER_COMMITS=$(printf '%s\n' "$UNIQUE_COMMITS" | grep -v '🌈' || true)
+  if [ -n "$RAINBOW_COMMITS" ] && [ -n "$OTHER_COMMITS" ]; then
+    UNIQUE_COMMITS="${RAINBOW_COMMITS}
+${OTHER_COMMITS}"
+  elif [ -n "$RAINBOW_COMMITS" ]; then
+    UNIQUE_COMMITS="$RAINBOW_COMMITS"
+  else
+    UNIQUE_COMMITS="$OTHER_COMMITS"
+  fi
+fi
+
+COMMITS=$(printf '%s\n' "$UNIQUE_COMMITS" | sed '/^$/d; s/^/- /')
 if [ -z "$COMMITS" ]; then
   echo "[SKIP] ${PREV_TAG} 之后没有新的 commit，跳过发布"
   exit 0
